@@ -600,7 +600,7 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
                     current.tool_outputs.append(text)
                     if msg.get("isError"):
                         current.errors.append(text)
-    if not turns and notes:
+    if not turns and notes and all(entry.get("type") == "session" for entry in entries):
         print(f"Cannot read {meta.uid}: {'; '.join(notes)}", file=sys.stderr)
     return turns, notes
 
@@ -700,11 +700,11 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             if not turns:
                 continue
             header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
-            searchable = "\n".join(
+            searchable = "\n".join(notes + [
                 part for turn in turns
                 for part in [turn.user_text, *turn.assistant_texts, *turn.tool_summaries,
                              *turn.tool_outputs, *turn.errors]
-            ).lower()
+            ]).lower()
             if not all(tok in searchable or tok in header_blob for tok in tokens):
                 continue
 
@@ -804,6 +804,7 @@ def render_read_turns(
     grep_kw: str | None,
     with_tools: bool,
     max_chars: int,
+    notes: list[str] | None = None,
 ) -> str:
     out: list[str] = [f"# Session `{meta.uid}` ({meta.agent}) — {meta.title or meta.cwd or meta.raw_id}"]
 
@@ -811,6 +812,10 @@ def render_read_turns(
         kw_low = grep_kw.lower()
         hits = 0
         out.append(f"Search keyword: `{grep_kw}`\n")
+        for note in notes or []:
+            if kw_low in note.lower():
+                hits += 1
+                out.append(f"**Session Note**: {match_excerpt(note, grep_kw)}")
         for t in turns:
             hay_parts = [t.user_text, *t.assistant_texts, *t.tool_summaries, *t.tool_outputs, *t.errors]
             if any(kw_low in p.lower() for p in hay_parts):
@@ -831,8 +836,11 @@ def render_read_turns(
                     if kw_low in error.lower():
                         out.append(f"**Error**: {match_excerpt(error, grep_kw)}")
         if hits == 0:
-            out.append("No turns or tool outputs matched that keyword.")
+            out.append("No dialogue, tool outputs, or session notes matched that keyword.")
         return "\n".join(out)
+
+    if notes:
+        out.append("\n## Session Notes\n" + "\n".join(f"- {note}" for note in notes))
 
     selected = turns
     if turn_range and not read_all:
@@ -908,10 +916,8 @@ def main() -> int:
         if show_overview:
             print(render_session_overview(meta, turns, notes, tail_count=args.tail) if turns else "Session has no readable turns.")
             return 0
-        if notes:
-            print("## Session Notes\n" + "\n".join(f"- {note}" for note in notes))
         read_all = args.all or (not args.turns and not args.grep)
-        print(render_read_turns(meta, turns, args.turns, read_all, args.grep, args.with_tools, args.max_chars))
+        print(render_read_turns(meta, turns, args.turns, read_all, args.grep, args.with_tools, args.max_chars, notes=notes))
         return 0
 
     p = argparse.ArgumentParser(

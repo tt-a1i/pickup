@@ -20,7 +20,7 @@ pickup 将各工具的本地格式转换成可读文本。它不迁移原会话�
 | Codex | `~/.codex/sessions/` | 主会话 JSONL |
 | Claude Code | `~/.claude/projects/` | 项目中的主会话 JSONL |
 | Qoder | `~/.qoder/projects/`、`~/.qoder-cn/projects/`、`~/.qoderwork/projects/` | 项目会话 JSONL |
-| Pi | `~/.pi/agent/sessions/` | 会话 JSONL |
+| Pi | `~/.pi/agent/sessions/` | 按最后持久化节点的父链读取当前分支，保留该路径上的早期对话 |
 | Kimi Code | `~/.kimi-code/sessions/` | 主 Agent 的已提交消息，跳过重复的回放事件 |
 | Devin CLI | `~/.local/share/devin/cli/sessions.db` | 沿当前消息分支还原对话，排除其他分支 |
 
@@ -124,6 +124,7 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 - 读取本机原始记录，SQLite 以只读模式打开；不上传历史，不调用模型，不启动常驻进程，也不创建索引数据库。
 - Agent 将读出的历史送入模型时，仍受该 Agent 的数据处理方式约束。命令输出也可能包含会话中的私密信息，分享前请检查。
 - 全历史文本搜索没有此前的最近记录数量限制，因此历史很多时会较慢；使用更具体的原话或 `--agent` 可以缩小查找范围。
+- Pi 以重新打开会话时采用的最后持久化节点恢复分支；仅在内存中切换、尚未写入后续节点的分支选择无法从磁盘还原。压缩和分支摘要会单独标示，历史提问不会仅因压缩而被删除。
 - 原始记录缺失的内容无法还原。长工具调用参数及输出片段有截断，检索结果不等同于完整审计日志。
 - 不支持 Devin 网页端的云端会话 API，不尝试获取账号凭据。
 
@@ -133,11 +134,12 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖候选列表行为、当前会话排除、旧记录搜索、ID 歧义、秒/毫秒时间戳、转义中文搜索、无关字段过滤、Antigravity 完整记录、关键词摘录、Pi 工具输出、Kimi 回放去重和 Devin 分支选择。测试使用临时样本，不包含个人会话数据。
+测试覆盖候选列表行为、当前会话排除、旧记录搜索、ID 歧义、Pi 唯一 ID 与分支选择、Claude/Qoder 文本块工具结果、秒/毫秒时间戳、转义中文搜索、无关字段过滤、Antigravity 完整记录、关键词摘录、Pi 工具输出、Kimi 回放去重和 Devin 分支选择。测试使用临时样本，不包含个人会话数据。
 
 ```text
 SKILL.md                  Agent 的使用说明
 scripts/pickup.py         检索、概览、阅读与原有格式适配
 scripts/pickup_extra.py   Kimi Code / Devin CLI 读取器
+scripts/pickup_pi.py      Pi 持久化分支选择
 tests/                    回归测试
 ```

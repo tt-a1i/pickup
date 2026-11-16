@@ -108,6 +108,71 @@ class HistoryRegressionTests(unittest.TestCase):
         result = p.render_read_turns(meta, [turn], None, False, 'needle', False, 60000)
         self.assertIn('before needle after', result)
 
+    def test_pi_candidates_have_unique_resolvable_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / '.pi/agent/sessions/project'
+            root.mkdir(parents=True)
+            for suffix in ('1', '2'):
+                sid = '12345678-0000-0000-0000-00000000000' + suffix
+                (root / ('2026-11-16_' + sid + '.jsonl')).write_text(
+                    json.dumps(dict(type='session', id=sid, cwd='/example')))
+            with patch.object(p, 'HOME', home):
+                sessions = p.discover_pi()
+            self.assertEqual(len({meta.uid for meta in sessions}), 2)
+            for meta in sessions:
+                self.assertIs(p.resolve_by_id(sessions, meta.uid), meta)
+
+    def test_pi_discovery_uses_header_id_for_custom_filenames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / '.pi/agent/sessions/project'
+            root.mkdir(parents=True)
+            (root / 'custom.jsonl').write_text(json.dumps(dict(type='session', id='header-session-id')))
+            with patch.object(p, 'HOME', home):
+                sessions = p.discover_pi()
+            self.assertEqual(sessions[0].raw_id, 'header-session-id')
+            self.assertEqual(sessions[0].uid, 'pi:header-session-id')
+
+    def test_claude_and_qoder_text_block_tool_results(self):
+        for agent in ('claude', 'qoder'):
+            with self.subTest(agent=agent), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+                rows = [dict(type='user', message=dict(content='request')),
+                        dict(type='user', message=dict(content=[dict(type='tool_result', content='string output')])),
+                        dict(type='user', message=dict(content=[dict(type='tool_result', content=[
+                            dict(type='text', text='array needle'),
+                            dict(type='image', source=dict(data='image-only')),
+                            dict(type='text', text='second block')])]))]
+                meta = self.write(directory, agent, rows)
+                turns, _ = p.parse_session(meta)
+                self.assertEqual(len(turns), 1)
+                self.assertEqual(turns[0].tool_outputs, ['string output', 'array needle\nsecond block'])
+                self.assertEqual(len(p.find_matching_sessions([meta], 'needle')), 1)
+                self.assertEqual(p.find_matching_sessions([meta], 'image-only'), [])
+                result = p.render_read_turns(meta, turns, None, True, None, True, 60000)
+                self.assertIn('array needle', result)
+
+    def test_pi_search_and_read_only_active_branch(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            def message(node_id, parent, role, text):
+                return dict(type='message', id=node_id, parentId=parent,
+                            message=dict(role=role, content=[dict(type='text', text=text)]))
+            rows = [dict(type='session', id='pi-session'),
+                    message('a', None, 'user', 'request'),
+                    message('b', 'a', 'assistant', 'abandoned-answer'),
+                    dict(type='compaction', id='c', parentId='a', summary='prior context'),
+                    message('d', 'c', 'assistant', 'active-answer')]
+            meta = self.write(directory, 'pi', rows)
+            turns, notes = p.parse_session(meta)
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].assistant_texts, ['active-answer'])
+            self.assertIn('prior context', notes[0])
+            self.assertEqual(p.find_matching_sessions([meta], 'abandoned-answer'), [])
+            self.assertEqual(len(p.find_matching_sessions([meta], 'active-answer')), 1)
+            shown = p.render_read_turns(meta, turns, None, True, None, False, 60000)
+            self.assertIn('active-answer', shown)
+            self.assertNotIn('abandoned-answer', shown)
+
     def test_pi_tool_result_is_searchable_and_visible(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             rows = [dict(type='message', message=dict(role='user', content=[dict(type='text', text='request')])),

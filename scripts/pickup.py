@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pickup_extra
+import pickup_pi
 
 HOME = pathlib.Path.home()
 
@@ -469,6 +470,10 @@ def parse_claude_like_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
                         text_parts.append(str(b["text"]).strip())
                     elif btype == "tool_result" and current is not None:
                         rc = b.get("content")
+                        if isinstance(rc, list):
+                            rc = "\n".join(part["text"] for part in rc
+                                           if isinstance(part, dict) and part.get("type") == "text"
+                                           and isinstance(part.get("text"), str))
                         if isinstance(rc, str) and rc.strip():
                             current.tool_outputs.append(rc.strip())
                 utext = "\n".join(x for x in text_parts if x)
@@ -527,9 +532,16 @@ def discover_pi() -> list[SessionMeta]:
     for f in files:
         st = f.stat()
         sid = f.stem.split("_")[-1]
+        try:
+            with f.open(encoding="utf-8", errors="replace") as stream:
+                header = json.loads(stream.readline())
+            if isinstance(header, dict) and header.get("type") == "session" and header.get("id"):
+                sid = str(header["id"])
+        except (OSError, ValueError):
+            pass
         out.append(
             SessionMeta(
-                uid=f"pi:{sid[:8]}",
+                uid=f"pi:{sid}",
                 agent="pi",
                 raw_id=sid,
                 path=f,
@@ -542,6 +554,7 @@ def discover_pi() -> list[SessionMeta]:
 def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
     turns: list[Turn] = []
     current: Turn | None = None
+    entries = []
     for line in meta.path.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -549,6 +562,10 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
             obj = json.loads(line)
         except Exception:
             continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    entries, notes = pickup_pi.select_entries(entries)
+    for obj in entries:
         otype = obj.get("type")
         ts = fmt_ts(obj.get("timestamp"))
         if otype == "session" and obj.get("cwd"):
@@ -583,7 +600,9 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
                     current.tool_outputs.append(text)
                     if msg.get("isError"):
                         current.errors.append(text)
-    return turns, []
+    if not turns and notes:
+        print(f"Cannot read {meta.uid}: {'; '.join(notes)}", file=sys.stderr)
+    return turns, notes
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +766,7 @@ def render_session_overview(meta: SessionMeta, turns: list[Turn], notes: list[st
 
     # 2. Background / Task notes (if any)
     if notes:
-        out.append("\n## Recent Background Task Logs")
+        out.append("\n## Session Notes and Background Task Logs")
         for n in notes:
             out.append(f"- {n}")
 
@@ -889,6 +908,8 @@ def main() -> int:
         if show_overview:
             print(render_session_overview(meta, turns, notes, tail_count=args.tail) if turns else "Session has no readable turns.")
             return 0
+        if notes:
+            print("## Session Notes\n" + "\n".join(f"- {note}" for note in notes))
         read_all = args.all or (not args.turns and not args.grep)
         print(render_read_turns(meta, turns, args.turns, read_all, args.grep, args.with_tools, args.max_chars))
         return 0

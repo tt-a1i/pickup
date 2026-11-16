@@ -689,7 +689,7 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             continue
         if not q:
             turns, notes = parse_session(meta)
-            if not turns:
+            if not turns and not notes:
                 continue
             results.append((meta.mtime, meta, turns, notes))
             if len(results) >= limit:
@@ -697,7 +697,7 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
         else:
             # Search the same decoded history that show/read can display.
             turns, notes = parse_session(meta)
-            if not turns:
+            if not turns and not notes:
                 continue
             header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
             searchable = "\n".join(notes + [
@@ -773,7 +773,10 @@ def render_session_overview(meta: SessionMeta, turns: list[Turn], notes: list[st
     # 3. Detailed Tail Turns
     start_idx = max(0, len(turns) - tail_count)
     tail_turns = turns[start_idx:]
-    out.append(f"\n## Latest Turns Detail (Turns {tail_turns[0].index}..{tail_turns[-1].index})")
+    if tail_turns:
+        out.append(f"\n## Latest Turns Detail (Turns {tail_turns[0].index}..{tail_turns[-1].index})")
+    else:
+        out.append("\nNo dialogue turns are stored; available context is shown in session notes.")
     for t in tail_turns:
         out.append(f"\n### Turn {t.index} ({t.timestamp})")
         out.append(f"**User**:\n{truncate_block(t.user_text, 1500)}")
@@ -914,7 +917,7 @@ def main() -> int:
             return 1
         turns, notes = parse_session(meta, use_full=True)
         if show_overview:
-            print(render_session_overview(meta, turns, notes, tail_count=args.tail) if turns else "Session has no readable turns.")
+            print(render_session_overview(meta, turns, notes, tail_count=args.tail) if turns or notes else "Session has no readable turns.")
             return 0
         read_all = args.all or (not args.turns and not args.grep)
         print(render_read_turns(meta, turns, args.turns, read_all, args.grep, args.with_tools, args.max_chars, notes=notes))

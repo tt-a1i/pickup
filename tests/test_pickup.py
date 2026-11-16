@@ -152,6 +152,22 @@ class HistoryRegressionTests(unittest.TestCase):
                 result = p.render_read_turns(meta, turns, None, True, None, True, 60000)
                 self.assertIn('array needle', result)
 
+    def test_pi_summary_only_history_can_be_found_and_opened(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            meta = self.write(directory, 'pi', [dict(type='session', id='pi-session'),
+                dict(type='compaction', id='a', parentId=None, summary='summary needle')])
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                self.assertEqual(len(p.find_matching_sessions([meta], 'needle')), 1)
+                self.assertEqual(len(p.find_matching_sessions([meta], None)), 1)
+                turns, notes = p.parse_session(meta)
+            self.assertEqual(errors.getvalue(), '')
+            self.assertEqual(turns, [])
+            overview = p.render_session_overview(meta, turns, notes)
+            self.assertIn('summary needle', overview)
+            grep = p.render_read_turns(meta, turns, None, False, 'needle', False, 60000, notes=notes)
+            self.assertIn('summary needle', grep)
+
     def test_pi_search_and_read_only_active_branch(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             def message(node_id, parent, role, text):

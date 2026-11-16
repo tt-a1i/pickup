@@ -104,6 +104,15 @@ def truncate_block(text: str, limit: int = 2400) -> str:
     return s[:limit] + f"\n… [truncated {len(s) - limit} chars]"
 
 
+def match_excerpt(text: str, keyword: str, context: int = 200) -> str:
+    index = text.lower().find(keyword.lower())
+    if index < 0:
+        return truncate_block(text, context * 2)
+    start = max(0, index - context)
+    end = min(len(text), index + len(keyword) + context)
+    return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+
+
 def clean_antigravity_user_text(raw: str) -> str:
     if not raw:
         return ""
@@ -159,7 +168,9 @@ def discover_antigravity() -> list[SessionMeta]:
 
     out: list[SessionMeta] = []
     for d in brain.iterdir():
-        tp = d / ".system_generated" / "logs" / "transcript.jsonl"
+        logs = d / ".system_generated" / "logs"
+        full = logs / "transcript_full.jsonl"
+        tp = full if full.is_file() else logs / "transcript.jsonl"
         if not tp.is_file():
             continue
         cid = d.name
@@ -183,7 +194,7 @@ def discover_antigravity() -> list[SessionMeta]:
     return out
 
 
-def parse_antigravity_turns(meta: SessionMeta, use_full: bool = False) -> tuple[list[Turn], list[str]]:
+def parse_antigravity_turns(meta: SessionMeta, use_full: bool = True) -> tuple[list[Turn], list[str]]:
     tp = meta.path
     if use_full:
         full_p = tp.parent / "transcript_full.jsonl"
@@ -561,6 +572,17 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
                         current.assistant_texts.append(str(b["text"]).strip())
                     elif b.get("type") == "toolCall":
                         current.tool_summaries.append(str(b.get("name") or "tool"))
+            elif role == "toolResult" and current is not None:
+                if isinstance(content, str):
+                    text = content.strip()
+                else:
+                    text = "\n".join(str(part["text"]) for part in content
+                                     if isinstance(part, dict) and part.get("type") == "text"
+                                     and part.get("text")).strip()
+                if text:
+                    current.tool_outputs.append(text)
+                    if msg.get("isError"):
+                        current.errors.append(text)
     return turns, []
 
 
@@ -591,7 +613,15 @@ def discover_all() -> list[SessionMeta]:
     return items
 
 
-def parse_session(meta: SessionMeta, use_full: bool = False) -> tuple[list[Turn], list[str]]:
+def parse_session(meta: SessionMeta, use_full: bool = True) -> tuple[list[Turn], list[str]]:
+    try:
+        return _parse_session(meta, use_full=use_full)
+    except OSError as error:
+        print(f"Cannot read {meta.uid}: {error}", file=sys.stderr)
+        return [], []
+
+
+def _parse_session(meta: SessionMeta, use_full: bool = True) -> tuple[list[Turn], list[str]]:
     if meta.agent in ("kimi", "devin"):
         parser = pickup_extra.parse_kimi if meta.agent == "kimi" else pickup_extra.parse_devin
         try:
@@ -646,29 +676,18 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             if len(results) >= limit:
                 break
         else:
-            # Fast pre-check on metadata + raw file text before full JSONL parse
-            header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
-            meta_hit = all(tok in header_blob for tok in tokens)
-            if not meta_hit and meta.agent not in ("kimi", "devin"):
-                try:
-                    raw_text = meta.path.read_text(encoding="utf-8", errors="ignore").lower()
-                except Exception:
-                    continue
-                if q_low not in raw_text and not all(tok in raw_text for tok in tokens):
-                    continue
-
+            # Search the same decoded history that show/read can display.
             turns, notes = parse_session(meta)
             if not turns:
                 continue
-
-            if meta.agent in ("kimi", "devin") and not meta_hit:
-                searchable = "\n".join(
-                    part for turn in turns
-                    for part in [turn.user_text, *turn.assistant_texts, *turn.tool_summaries,
-                                 *turn.tool_outputs, *turn.errors]
-                ).lower()
-                if not all(tok in searchable for tok in tokens):
-                    continue
+            header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
+            searchable = "\n".join(
+                part for turn in turns
+                for part in [turn.user_text, *turn.assistant_texts, *turn.tool_summaries,
+                             *turn.tool_outputs, *turn.errors]
+            ).lower()
+            if not all(tok in searchable or tok in header_blob for tok in tokens):
+                continue
 
             # Rank literal matches, then break ties by recency.
             dialogue_blob = "\n".join(
@@ -682,7 +701,7 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             elif all(tok in dialogue_blob or tok in header_blob for tok in tokens):
                 score += 200.0
             else:
-                # Matched only inside raw tool noise; lower priority
+                # Matched retained tool output or errors; lower priority
                 score += 50.0
 
             # Add a bounded recency bonus
@@ -778,18 +797,20 @@ def render_read_turns(
             if any(kw_low in p.lower() for p in hay_parts):
                 hits += 1
                 out.append(f"### Turn {t.index} ({t.timestamp})")
-                out.append(f"**User**: {one_line(t.user_text, 300)}")
+                out.append(f"**User**: {match_excerpt(t.user_text, grep_kw) if kw_low in t.user_text.lower() else one_line(t.user_text, 300)}")
                 matching_tools = [s for s in t.tool_summaries if kw_low in s.lower()]
                 if matching_tools:
                     out.append("**Matching Tools**: " + ", ".join(f"`{s}`" for s in matching_tools[:10]))
                 for at in t.assistant_texts:
                     if kw_low in at.lower():
-                        out.append(f"**Assistant**:\n{truncate_block(at, 1200)}")
+                        out.append(f"**Assistant**:\n{match_excerpt(at, grep_kw)}")
                 for to in t.tool_outputs:
                     if kw_low in to.lower():
-                        idx = to.lower().find(kw_low)
-                        snippet = to[max(0, idx - 200) : idx + 400]
+                        snippet = match_excerpt(to, grep_kw)
                         out.append(f"**Tool Output Snippet**:\n```\n{snippet}\n```")
+                for error in t.errors:
+                    if kw_low in error.lower():
+                        out.append(f"**Error**: {match_excerpt(error, grep_kw)}")
         if hits == 0:
             out.append("No turns or tool outputs matched that keyword.")
         return "\n".join(out)

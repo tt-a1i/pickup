@@ -16,7 +16,7 @@ pickup 将各工具的本地格式转换成可读文本。它不迁移原会话�
 
 | 工具 | 默认本地记录位置 | 读取范围 |
 | --- | --- | --- |
-| Antigravity | `~/.gemini/antigravity/brain/` | 主会话 transcript、可用的后台任务日志 |
+| Antigravity | `~/.gemini/antigravity/brain/` | 优先使用完整主会话 transcript、可用的后台任务日志 |
 | Codex | `~/.codex/sessions/` | 主会话 JSONL |
 | Claude Code | `~/.claude/projects/` | 项目中的主会话 JSONL |
 | Qoder | `~/.qoder/projects/`、`~/.qoder-cn/projects/`、`~/.qoderwork/projects/` | 项目会话 JSONL |
@@ -75,7 +75,7 @@ python3 scripts/pickup.py --limit 10
 python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 ```
 
-**查找只返回候选，不自动读取第一名。** 无线索时按记录文件的修改时间排序；有线索时，按标题、对话和工具记录中的文字匹配排序，再考虑时间。排序不代表已经确定用户意图，也不是语义搜索。
+**查找只返回候选，不自动读取第一名。** 无线索时按记录文件的修改时间排序；有线索时，对解析后的标题、对话和保留的工具记录做文字匹配并排序，再考虑时间。排序不代表已经确定用户意图，也不是语义搜索。
 
 当运行环境提供受支持的当前会话 ID 时，脚本自动排除它；缺少该信息时，可用 `--exclude`。脚本不会根据一句“pickup”就判定某条记录是当前会话。
 
@@ -133,7 +133,7 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖候选列表行为、当前会话排除、旧记录搜索、ID 歧义、秒/毫秒时间戳、Kimi 回放去重和 Devin 分支选择。测试使用临时样本，不包含个人会话数据。
+测试覆盖候选列表行为、当前会话排除、旧记录搜索、ID 歧义、秒/毫秒时间戳、转义中文搜索、无关字段过滤、Antigravity 完整记录、关键词摘录、Pi 工具输出、Kimi 回放去重和 Devin 分支选择。测试使用临时样本，不包含个人会话数据。
 
 ```text
 SKILL.md                  Agent 的使用说明

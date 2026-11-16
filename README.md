@@ -1,3 +1,5 @@
+![pickup — Pick up where you left off.](assets/cover.jpg)
+
 # pickup
 
 **让新的 AI Agent 找到并读懂另一段本地会话。**

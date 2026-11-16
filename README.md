@@ -1,4 +1,4 @@
-![pickup — Find & read any local AI agent session.](assets/cover-v2.jpg)
+![pickup — Find & read any local AI agent session.](assets/cover-v3.jpg)
 
 # pickup
 

@@ -600,7 +600,9 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
                     current.tool_outputs.append(text)
                     if msg.get("isError"):
                         current.errors.append(text)
+    meta.status = ""
     if not turns and notes and all(entry.get("type") == "session" for entry in entries):
+        meta.status = "UNREADABLE"
         print(f"Cannot read {meta.uid}: {'; '.join(notes)}", file=sys.stderr)
     return turns, notes
 
@@ -689,7 +691,7 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             continue
         if not q:
             turns, notes = parse_session(meta)
-            if not turns and not notes:
+            if meta.status == "UNREADABLE" or (not turns and not notes):
                 continue
             results.append((meta.mtime, meta, turns, notes))
             if len(results) >= limit:
@@ -697,7 +699,7 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
         else:
             # Search the same decoded history that show/read can display.
             turns, notes = parse_session(meta)
-            if not turns and not notes:
+            if meta.status == "UNREADABLE" or (not turns and not notes):
                 continue
             header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
             searchable = "\n".join(notes + [

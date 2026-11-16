@@ -152,6 +152,15 @@ class HistoryRegressionTests(unittest.TestCase):
                 result = p.render_read_turns(meta, turns, None, True, None, True, 60000)
                 self.assertIn('array needle', result)
 
+    def test_pi_broken_chain_is_not_a_summary_only_candidate(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            meta = self.write(directory, 'pi', [dict(type='session', id='pi-session'),
+                dict(type='message', id='a', parentId='missing', message=dict(role='user', content=[]))])
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(p.find_matching_sessions([meta], None), [])
+                self.assertEqual(p.find_matching_sessions([meta], 'broken'), [])
+            self.assertEqual(meta.status, 'UNREADABLE')
+
     def test_pi_summary_only_history_can_be_found_and_opened(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             meta = self.write(directory, 'pi', [dict(type='session', id='pi-session'),

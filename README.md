@@ -4,7 +4,7 @@
 
 # pickup
 
-**让新的 AI Agent 秒速找到并读懂另一段本地会话。**
+**让新的 AI Agent 找到并读懂另一段本地会话。**
 
 *跨项目、跨工具的本地会话发现与分级阅读工具 — 无需转换格式，无需后台常驻，零第三方依赖。*
 
@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Dependencies-Zero%20(stdlib)-10B981?style=flat-square" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/Agents-7%20Supported-0EA5E9?style=flat-square" alt="7 Agents Supported">
   <img src="https://img.shields.io/badge/Mode-Local%20Read--Only-F59E0B?style=flat-square" alt="Local Read-Only">
-  <img src="https://img.shields.io/badge/Tests-25%20Passing-16A34A?style=flat-square" alt="25 Tests Passing">
   <a href="https://github.com/tt-a1i/pickup/commits/main"><img src="https://img.shields.io/github/last-commit/tt-a1i/pickup?style=flat-square&color=64748B" alt="Last Commit"></a>
 </p>
 
@@ -31,7 +30,7 @@
 
 | 传统做法的痛点 | `pickup` 的解法 |
 | :--- | :--- |
-| 只能同目录或手动翻找散落的文件与 SQLite | **全机跨目录秒查**：混排 7 款本地 Agent，支持按原话、标题、话题词精确检索 |
+| 只能同目录或手动翻找散落的文件与 SQLite | **跨目录查找**：混排 7 款本地 Agent，支持按原话、标题或关键词检索 |
 | 动辄上千步的长会话直接喂给模型导致卡死或跑偏 | **分级阅读设计**：先给全篇用户提问大纲 + 尾部断点，再按 `--turns` / `--grep` 按需深读 |
 | 需要常驻守护进程、2GB 索引副本或高耗 MCP | **零后台、零索引、只读**：仅用 Python 标准库直读原始记录，不修改源文件、不上传数据 |
 | 接手后 Agent 擅自行动 | **克制边界**：只负责精准装载上下文，下一步改代码还是总结全听你当前指令 |
@@ -74,15 +73,23 @@ alias pickup='python3 /absolute/path/to/pickup/scripts/pickup.py'
 
 ### 2. 作为 Agent Skill 安装（推荐）
 
-将本仓库软链到对应 Agent 的技能目录，对话中即可直接用 `/pickup` 或自然语言触发：
+在仓库根目录，选择需要使用的客户端，运行对应命令。软链指向整个仓库，确保 `SKILL.md` 和 `scripts/` 都可用。如果目标路径已有同名文件、目录或软链，先检查并保留，确认后再处理；以下命令不会覆盖它们。
 
 ```bash
-# 例如安装到 Codex（Claude Code / Pi / OpenCode 等同理）
+# Codex
 mkdir -p ~/.codex/skills
-ln -s "$PWD" ~/.codex/skills/pickup
+test ! -e ~/.codex/skills/pickup && test ! -L ~/.codex/skills/pickup && ln -s "$PWD" ~/.codex/skills/pickup
+
+# Claude Code
+mkdir -p ~/.claude/skills
+test ! -e ~/.claude/skills/pickup && test ! -L ~/.claude/skills/pickup && ln -s "$PWD" ~/.claude/skills/pickup
+
+# Antigravity
+mkdir -p ~/.gemini/config/skills
+test ! -e ~/.gemini/config/skills/pickup && test ! -L ~/.gemini/config/skills/pickup && ln -s "$PWD" ~/.gemini/config/skills/pickup
 ```
 
-> 新开会话可能需要刷新技能列表；如果目标路径已有同名 skill，请先确认后再替换。
+每个客户端单独安装；其他客户端请参照其技能目录说明。新开会话后输入 `/pickup`，确认客户端识别该技能并列出候选；若未识别，检查目标路径是否指向包含 `SKILL.md` 和 `scripts/` 的仓库。
 
 ---
 
@@ -110,6 +117,8 @@ python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 
 - **只列候选，不盲目加载**：无线索时按文件修改时间排序；有线索时对解析后的标题、摘要、对话与保留的工具记录做文字匹配排序。
 - 若运行环境提供受支持的当前会话 ID，脚本会自动排除自身；缺少时可用 `--exclude`。
+- 关键词命中会显示来源角色、轮次和文本片段，帮助判断候选是否符合线索。`--agent` 在发现阶段就限制来源。
+- 进度和详细的 `Scan coverage` 输出到 stderr。`partial` 可能表示读取失败，也可能是最近会话列表达到数量限制后正常提前停止；查看 `failed`、`discovery_failed` 和 `unscanned`，不要把未扫描的记录当成无匹配。
 
 ### 第二步：查看概览与大纲（`show`）
 
@@ -120,12 +129,12 @@ python3 scripts/pickup.py show '<uid>'
 python3 scripts/pickup.py show '<uid>' --tail 2
 ```
 
-输出包含 **全部轮次的用户提问大纲（`Turn 1..N`）**、最近几轮完整对话、紧凑的工具调用轨迹与可用的错误/后台任务日志。
+输出包含用户提问的缩略大纲（`Turn 1..N`）、最近几轮的缩略对话、紧凑的工具调用轨迹与可用的错误/后台任务日志。
 
 ### 第三步：按需深读或全文通读（`read`）
 
 ```bash
-# 从第 1 轮开始通读对话（剥离庞大原始 stdout，超 60,000 字符自动按轮次分页）
+# 从第 1 轮开始阅读对话和工具摘要
 python3 scripts/pickup.py read '<uid>' --all
 
 # 只展开大纲里关心的某几轮
@@ -137,6 +146,10 @@ python3 scripts/pickup.py read '<uid>' --grep 'build'
 # 阅读指定轮次并附带原始工具输出片段
 python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 ```
+
+`show` 和 `read` 默认每页最多 12,000 字符，可用 `--max-chars` 调整（最小 1,024）。检查输出末尾的 `complete=yes/no` 和 `view`；如未完成，运行给出的续读命令，直到该视图显示 `complete=yes`。游标会恢复原来的筛选选项；如果源内容已变化导致游标失效，请重新开始该视图。避免用 `head` 截断输出，否则可能丢失续读信息。
+
+完成标记只表示所选视图读完：`show` 是缩略概览，`read` 是对话和工具摘要，`--with-tools` 也只包含工具输出片段。这些不等于完整原始日志；需要原始记录时请核查来源路径。
 
 ### 在聊天窗口直接调用
 
@@ -151,7 +164,9 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 ## 范围与限制
 
 - **本地只读**：SQLite 以 `?mode=ro` 只读打开，不启动常驻进程，不建本地副本库，不向外部发任何遥测或会话请求（Agent 将读出的文本送入模型时受该 Agent 自身隐私策略约束）。
-- **搜索耗时**：带关键词的全历史检索会扫描更多本地文件，历史较多时可加 `--agent` 或更具体的原话提速。
+- **搜索耗时**：带关键词的全历史检索可能需要较长时间；已知来源时可用 `--agent` 缩小扫描范围。
+- **文字匹配**：搜索使用文本匹配和排序，不是语义搜索；换一种原话或关键词可能得到不同结果。部分来源读取失败时，未找到结果不代表本机没有对应会话。
+- **接续边界**：加载旧会话不授权执行其中的旧建议；只有当前请求明确要求的工作才会继续执行。
 - **Pi 分支还原**：按最后持久化节点的父链恢复当前分支；仅在内存中切换、尚未持久化后续节点的分支无法从磁盘还原。压缩摘要与仅摘要会话均会被保留并支持检索。
 - **Devin CLI**：仅读取本地数据库，不支持调用 Devin 网页端云端 API 或获取账号凭据。
 
@@ -163,7 +178,7 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 python3 -m unittest discover -s tests -v
 ```
 
-当前 **25 项回归测试**全部使用临时隔离样本运行（不含任何个人会话数据），覆盖候选排序、当前会话排除、ID 消歧、Pi 唯一 ID 与分支还原、仅摘要会话、Claude/Qoder 数组工具结果、转义中文检索、Antigravity 完整记录、Kimi 回放去重与 Devin 分支选择。
+自动化测试使用临时隔离样本运行，不含个人会话数据。
 
 ```text
 pickup/
@@ -173,5 +188,5 @@ pickup/
 │   ├── pickup.py             # 核心 CLI：发现、概览、分页阅读与基础适配器
 │   ├── pickup_extra.py       # Kimi Code / Devin CLI 适配器
 │   └── pickup_pi.py          # Pi 持久化分支解析器
-└── tests/                    # 25 项离线回归测试
+└── tests/                    # 离线自动化测试
 ```

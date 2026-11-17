@@ -4,7 +4,7 @@
 
 # pickup
 
-**Let any AI coding agent find and read another local session in seconds.**
+**Let an AI coding agent find and read another local session.**
 
 *Cross-project, cross-tool local session discovery and progressive reading — zero format conversion, zero background daemons, zero third-party dependencies.*
 
@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Dependencies-Zero%20(stdlib)-10B981?style=flat-square" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/Agents-7%20Supported-0EA5E9?style=flat-square" alt="7 Agents Supported">
   <img src="https://img.shields.io/badge/Mode-Local%20Read--Only-F59E0B?style=flat-square" alt="Local Read-Only">
-  <img src="https://img.shields.io/badge/Tests-25%20Passing-16A34A?style=flat-square" alt="25 Tests Passing">
   <a href="https://github.com/tt-a1i/pickup/commits/main"><img src="https://img.shields.io/github/last-commit/tt-a1i/pickup?style=flat-square&color=64748B" alt="Last Commit"></a>
 </p>
 
@@ -74,15 +73,23 @@ alias pickup='python3 /absolute/path/to/pickup/scripts/pickup.py'
 
 ### 2. Install as an Agent Skill (Recommended)
 
-Symlink the repository into your agent's skills directory so `/pickup` or natural-language requests trigger automatically:
+From the repository root, run the commands for each client you use. Link the whole repository so both `SKILL.md` and `scripts/` are available. If the target already exists as a file, directory, or symlink, inspect and preserve it until you decide how to handle it; these commands will not overwrite it.
 
 ```bash
-# Example for Codex (same pattern works for Claude Code, Pi, OpenCode, etc.)
+# Codex
 mkdir -p ~/.codex/skills
-ln -s "$PWD" ~/.codex/skills/pickup
+test ! -e ~/.codex/skills/pickup && test ! -L ~/.codex/skills/pickup && ln -s "$PWD" ~/.codex/skills/pickup
+
+# Claude Code
+mkdir -p ~/.claude/skills
+test ! -e ~/.claude/skills/pickup && test ! -L ~/.claude/skills/pickup && ln -s "$PWD" ~/.claude/skills/pickup
+
+# Antigravity
+mkdir -p ~/.gemini/config/skills
+test ! -e ~/.gemini/config/skills/pickup && test ! -L ~/.gemini/config/skills/pickup && ln -s "$PWD" ~/.gemini/config/skills/pickup
 ```
 
-> Open a new session to refresh discovered skills. If a skill with the same name already exists at the target path, inspect it before replacing.
+Install separately for each client. For other clients, consult their skill directory instructions. Open a new session and enter `/pickup` to check that the client recognizes the skill and lists candidates. If it does not, check that the target points to the repository containing `SKILL.md` and `scripts/`.
 
 ---
 
@@ -110,6 +117,8 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 
 - **Discovery only — never auto-loads #1**: without a query, candidates sort by file modification time; with a query, matches in parsed titles, summaries, and dialogue outrank tool-output matches.
 - Automatically excludes the active session when the caller runtime supplies its session ID; use `--exclude` otherwise.
+- Keyword matches include the source role, turn and text snippet to help assess candidates. `--agent` limits sources before discovery.
+- Progress and detailed `Scan coverage` go to stderr. `partial` can mean a read failed or that the recent-session list stopped normally after reaching its limit. Check `failed`, `discovery_failed` and `unscanned`; unscanned records are not evidence of no match.
 
 ### 2. Inspect overview & outline (`show`)
 
@@ -118,12 +127,12 @@ python3 scripts/pickup.py show '<uid>'
 python3 scripts/pickup.py show '<uid>' --tail 2
 ```
 
-Returns **every user prompt in the session (`Turn 1..N`)** as a compact outline, plus full details of the latest turns, tool call trails, and available errors or background task logs.
+Returns a compact outline of **user prompts (`Turn 1..N`)**, plus shortened recent turns, tool call trails, and available errors or background task logs.
 
 ### 3. Read deeper on demand (`read`)
 
 ```bash
-# Read dialogue from Turn 1 onwards (strips bulky raw stdout; paginates at 60,000 chars)
+# Read dialogue and tool summaries from turn 1
 python3 scripts/pickup.py read '<uid>' --all
 
 # Read a specific turn range spotted in the outline
@@ -135,6 +144,10 @@ python3 scripts/pickup.py read '<uid>' --grep 'build'
 # Include raw tool output snippets
 python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 ```
+
+`show` and `read` default to at most 12,000 characters per page; use `--max-chars` to adjust it (minimum 1,024). Check the final `complete=yes/no` and `view` markers, and run each continuation command until that view reports `complete=yes`. The cursor restores the original filters; if a changed source invalidates it, restart that view. Avoid truncating the output with `head`, which can hide continuation information.
+
+Completion applies only to the selected view: `show` is a shortened overview, `read` contains dialogue and tool summaries, and `--with-tools` includes snippets of tool output. These are not complete raw logs; check the source path when raw records are needed.
 
 ### Using `/pickup` in chat
 
@@ -149,7 +162,9 @@ Once installed as a skill, just type in any new chat:
 ## Scope & Limitations
 
 - **Strict local read-only**: opens SQLite with `?mode=ro`, spawns no daemons, builds no duplicate index DB, and makes zero network requests. (Content passed to an LLM by your host agent remains subject to that agent's data handling.)
-- **Search latency**: full-history text search scans older files without a cap; narrow large histories with `--agent` or a specific phrase.
+- **Search latency**: full-history text search can take time; use `--agent` to narrow the scan when the source is known.
+- **Text matching**: search matches and ranks text; it is not semantic search. Try another exact phrase or keyword if needed. A failed source read means a lack of results does not establish that the session is absent locally.
+- **Continuation boundary**: loading an old session does not authorize executing its old suggestions; continue only work requested now.
 - **Pi branch resolution**: follows the parent chain from the last persisted node on disk; uncommitted in-memory branch switches cannot be inferred. Compaction summaries and summary-only sessions are preserved and searchable.
 - **Devin CLI**: reads the local database only; does not access Devin's cloud web API or credentials.
 
@@ -161,7 +176,7 @@ Once installed as a skill, just type in any new chat:
 python3 -m unittest discover -s tests -v
 ```
 
-All **25 regression tests** run offline against temporary fixtures (no personal session data), covering candidate ranking, caller exclusion, ID disambiguation, Pi unique IDs & persisted branch resolution, summary-only sessions, Claude/Qoder array tool results, escaped CJK search, Antigravity full transcripts, Kimi replay deduplication, and Devin branch selection.
+Automated tests run offline against temporary fixtures without personal session data.
 
 ```text
 pickup/
@@ -171,5 +186,5 @@ pickup/
 │   ├── pickup.py             # Core CLI: discovery, show, paginated read & adapters
 │   ├── pickup_extra.py       # Kimi Code / Devin CLI readers
 │   └── pickup_pi.py          # Pi persisted-branch resolver
-└── tests/                    # 25 offline regression tests
+└── tests/                    # Offline automated tests
 ```

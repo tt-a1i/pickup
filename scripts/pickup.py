@@ -15,6 +15,8 @@ Supports macOS local stores out of the box (read-only, zero index DB, zero daemo
 from __future__ import annotations
 
 import argparse
+import hashlib
+from contextlib import closing
 import datetime as dt
 import json
 import os
@@ -23,11 +25,13 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pickup_extra
 import pickup_pi
+import pickup_paging
+from pickup_scan import ScanReport
 
 HOME = pathlib.Path.home()
 
@@ -66,6 +70,8 @@ class SessionMeta:
     title: str = ""
     status: str = ""
     preview: str = ""
+    match_evidence: str = ""
+    parse_warnings: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +144,7 @@ def is_excluded(meta: SessionMeta, excluded: set[str]) -> bool:
 # Store 1: Antigravity (~/.gemini/antigravity)
 # ---------------------------------------------------------------------------
 
-def discover_antigravity() -> list[SessionMeta]:
+def discover_antigravity(on_error=None) -> list[SessionMeta]:
     base = HOME / ".gemini" / "antigravity"
     brain = base / "brain"
     if not brain.is_dir():
@@ -148,12 +154,11 @@ def discover_antigravity() -> list[SessionMeta]:
     db_path = base / "conversation_summaries.db"
     if db_path.is_file():
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            rows = conn.execute(
-                "SELECT conversation_id, title, workspace_uris, status, parent_conversation_id "
-                "FROM conversation_summaries"
-            ).fetchall()
-            conn.close()
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                rows = conn.execute(
+                    "SELECT conversation_id, title, workspace_uris, status, parent_conversation_id "
+                    "FROM conversation_summaries"
+                ).fetchall()
             for cid, title, ws_raw, status, parent_id in rows:
                 cwd = ""
                 if ws_raw:
@@ -164,8 +169,9 @@ def discover_antigravity() -> list[SessionMeta]:
                 if parent_id:
                     st = f"SUBAGENT({st})"
                 db_meta[cid] = (title or "", cwd, st, 1 if parent_id else 0)
-        except Exception:
-            pass
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            if on_error:
+                on_error("antigravity", "metadata unavailable; falling back to transcript files")
 
     out: list[SessionMeta] = []
     for d in brain.iterdir():
@@ -210,7 +216,11 @@ def parse_antigravity_turns(meta: SessionMeta, use_full: bool = True) -> tuple[l
             continue
         try:
             obj = json.loads(line)
-        except Exception:
+        except (ValueError, TypeError):
+            meta.parse_warnings += 1
+            continue
+        if not isinstance(obj, dict):
+            meta.parse_warnings += 1
             continue
         stype = obj.get("type")
         created = fmt_ts(obj.get("created_at"))
@@ -276,6 +286,8 @@ def _is_codex_injected_user_block(text: str) -> bool:
     s = text.strip()
     if not s:
         return True
+    if re.fullmatch(r"<skill>\s*<name>[^<]+</name>[\s\S]*</skill>", s):
+        return True
     if s.startswith(CODEX_SYSTEM_PREFIXES):
         return True
     if s.startswith("<image ") or s == "</image>":
@@ -283,7 +295,7 @@ def _is_codex_injected_user_block(text: str) -> bool:
     return False
 
 
-def discover_codex() -> list[SessionMeta]:
+def discover_codex(on_error=None) -> list[SessionMeta]:
     sess_root = HOME / ".codex" / "sessions"
     if not sess_root.is_dir():
         return []
@@ -312,7 +324,9 @@ def discover_codex() -> list[SessionMeta]:
                         if isinstance(src, dict) and "subagent" in src:
                             is_subagent = True
                         break
-        except Exception:
+        except (OSError, ValueError, TypeError, AttributeError):
+            if on_error:
+                on_error("codex", "session metadata could not be read")
             continue
 
         if is_subagent:
@@ -340,9 +354,13 @@ def parse_codex_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
             continue
         try:
             obj = json.loads(line)
-        except Exception:
+        except (ValueError, TypeError):
+            meta.parse_warnings += 1
             continue
 
+        if not isinstance(obj, dict):
+            meta.parse_warnings += 1
+            continue
         ts = fmt_ts(obj.get("timestamp"))
         otype = obj.get("type")
         p = obj.get("payload") or {}
@@ -438,9 +456,13 @@ def parse_claude_like_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
             continue
         try:
             obj = json.loads(line)
-        except Exception:
+        except (ValueError, TypeError):
+            meta.parse_warnings += 1
             continue
 
+        if not isinstance(obj, dict):
+            meta.parse_warnings += 1
+            continue
         otype = obj.get("type")
         ts = fmt_ts(obj.get("timestamp"))
 
@@ -560,12 +582,18 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
             continue
         try:
             obj = json.loads(line)
-        except Exception:
+        except (ValueError, TypeError):
+            meta.parse_warnings += 1
             continue
         if isinstance(obj, dict):
             entries.append(obj)
+        else:
+            meta.parse_warnings += 1
     entries, notes = pickup_pi.select_entries(entries)
     for obj in entries:
+        if not isinstance(obj, dict):
+            meta.parse_warnings += 1
+            continue
         otype = obj.get("type")
         ts = fmt_ts(obj.get("timestamp"))
         if otype == "session" and obj.get("cwd"):
@@ -611,45 +639,83 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
 # Unified discovery, parsing, matching, and rendering
 # ---------------------------------------------------------------------------
 
-def discover_all() -> list[SessionMeta]:
-    items: list[SessionMeta] = []
-    items.extend(discover_antigravity())
-    items.extend(discover_codex())
-    items.extend(discover_claude_like("claude", [HOME / ".claude" / "projects"]))
-    items.extend(
-        discover_claude_like(
-            "qoder",
-            [HOME / ".qoder" / "projects", HOME / ".qoder-cn" / "projects", HOME / ".qoderwork" / "projects"],
-        )
-    )
-    items.extend(discover_pi())
-    for agent, discover in (("kimi", pickup_extra.discover_kimi), ("devin", pickup_extra.discover_devin)):
-        for data in discover():
-            items.append(SessionMeta(
-                uid=f"{agent}:{data['raw_id']}", agent=agent,
-                raw_id=data["raw_id"], path=pathlib.Path(data["path"]),
-                mtime=data["mtime"], cwd=data["cwd"], title=data["title"],
-            ))
+AGENTS = ("antigravity", "codex", "claude", "qoder", "pi", "kimi", "devin")
+
+
+def discover_all(agents=None, report=None) -> list[SessionMeta]:
+    selected = AGENTS if agents is None else agents
+    roots = {
+        "antigravity": [HOME / ".gemini/antigravity/brain"],
+        "codex": [HOME / ".codex/sessions"],
+        "claude": [HOME / ".claude/projects"],
+        "qoder": [HOME / ".qoder/projects", HOME / ".qoder-cn/projects", HOME / ".qoderwork/projects"],
+        "pi": [HOME / ".pi/agent/sessions"],
+        "kimi": [HOME / ".kimi-code/sessions"],
+        "devin": [HOME / ".local/share/devin/cli/sessions.db"],
+    }
+    def diagnostic(agent, reason):
+        if report:
+            report.discovery_failed(agent, reason)
+        else:
+            print(f"Discovery failed [{agent}]: {reason}", file=sys.stderr)
+    loaders = {
+        "antigravity": lambda: discover_antigravity(on_error=(lambda ag, why: report.warning(ag, why)) if report else None),
+        "codex": lambda: discover_codex(on_error=diagnostic),
+        "claude": lambda: discover_claude_like("claude", roots["claude"]),
+        "qoder": lambda: discover_claude_like("qoder", roots["qoder"]),
+        "pi": discover_pi,
+        "kimi": lambda: pickup_extra.discover_kimi(roots["kimi"][0], on_error=diagnostic),
+        "devin": lambda: pickup_extra.discover_devin(roots["devin"][0], on_error=diagnostic),
+    }
+    items = []
+    for agent in selected:
+        if report:
+            report.source(agent, any(path.exists() for path in roots[agent]))
+            print(f"Discovering {agent} stores...", file=report.stream, flush=True)
+        try:
+            found = loaders[agent]()
+            if agent in ("kimi", "devin"):
+                found = [SessionMeta(uid=f"{agent}:{data['raw_id']}", agent=agent,
+                         raw_id=data["raw_id"], path=pathlib.Path(data["path"]),
+                         mtime=data["mtime"], cwd=data["cwd"], title=data["title"]) for data in found]
+        except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+            diagnostic(agent, "source discovery failed; this source may be incomplete")
+            found = []
+        if report:
+            report.discovered(agent, len(found))
+        items.extend(found)
+    # A printed UID must resolve to exactly one discovered session.
+    counts = {}
+    for item in items:
+        counts[item.uid] = counts.get(item.uid, 0) + 1
+    for item in items:
+        if counts[item.uid] > 1:
+            item.uid = f"{item.agent}:{item.raw_id}"
     items.sort(key=lambda m: m.mtime, reverse=True)
     return items
 
 
 def parse_session(meta: SessionMeta, use_full: bool = True) -> tuple[list[Turn], list[str]]:
+    meta.parse_warnings = 0
+    if meta.status == "UNREADABLE":
+        meta.status = ""
     try:
-        return _parse_session(meta, use_full=use_full)
-    except OSError as error:
-        print(f"Cannot read {meta.uid}: {error}", file=sys.stderr)
+        result = _parse_session(meta, use_full=use_full)
+        if meta.parse_warnings:
+            print(f"Decode warning [{meta.uid}]: {meta.parse_warnings} malformed records or incomplete branches; decoded view may be incomplete", file=sys.stderr)
+        return result
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        meta.status = "UNREADABLE"
+        print(f"Cannot read {meta.uid}: source read or format error", file=sys.stderr)
         return [], []
 
 
 def _parse_session(meta: SessionMeta, use_full: bool = True) -> tuple[list[Turn], list[str]]:
     if meta.agent in ("kimi", "devin"):
         parser = pickup_extra.parse_kimi if meta.agent == "kimi" else pickup_extra.parse_devin
-        try:
-            records = parser(str(meta.path))
-        except (OSError, ValueError, sqlite3.Error) as error:
-            print(f"Cannot read {meta.uid}: {error}", file=sys.stderr)
-            return [], []
+        def decode_warning(agent, reason):
+            meta.parse_warnings += 1
+        records = parser(str(meta.path), on_error=decode_warning)
         return [Turn(index=i, **record) for i, record in enumerate(records, 1)], []
     if meta.agent == "antigravity":
         return parse_antigravity_turns(meta, use_full=use_full)
@@ -677,7 +743,7 @@ def resolve_by_id(all_metas: list[SessionMeta], target: str) -> SessionMeta | No
     return matches[0] if matches else None
 
 
-def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limit: int = 8, excluded: set[str] | None = None) -> list[tuple[SessionMeta, list[Turn], list[str]]]:
+def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limit: int = 8, excluded: set[str] | None = None, report=None) -> list[tuple[SessionMeta, list[Turn], list[str]]]:
     q = (query or "").strip()
     q_low = q.lower()
     tokens = [tok for tok in re.split(r"\s+", q_low) if tok]
@@ -688,18 +754,39 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
     excluded = caller_session_ids() | (excluded or set())
     for meta in all_metas:
         if is_excluded(meta, excluded):
+            if report:
+                report.excluded(meta.agent)
             continue
+        if report:
+            report.attempted(meta.agent, meta.uid)
         if not q:
             turns, notes = parse_session(meta)
-            if meta.status == "UNREADABLE" or (not turns and not notes):
+            if meta.status == "UNREADABLE":
+                if report:
+                    report.failed(meta.agent, meta.uid, "source unreadable or invalid active branch")
                 continue
+            if report:
+                report.readable(meta.agent)
+                if meta.parse_warnings:
+                    report.warning(meta.agent, "some source records or branches could not be decoded")
+            if not turns and not notes:
+                continue
+            meta.match_evidence = "recent file modification; no query supplied"
             results.append((meta.mtime, meta, turns, notes))
             if len(results) >= limit:
                 break
         else:
             # Search the same decoded history that show/read can display.
             turns, notes = parse_session(meta)
-            if meta.status == "UNREADABLE" or (not turns and not notes):
+            if meta.status == "UNREADABLE":
+                if report:
+                    report.failed(meta.agent, meta.uid, "source unreadable or invalid active branch")
+                continue
+            if report:
+                report.readable(meta.agent)
+                if meta.parse_warnings:
+                    report.warning(meta.agent, "some source records or branches could not be decoded")
+            if not turns and not notes:
                 continue
             header_blob = f"{meta.uid} {meta.raw_id} {meta.agent} {meta.title} {meta.cwd}".lower()
             searchable = "\n".join(notes + [
@@ -709,6 +796,8 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             ]).lower()
             if not all(tok in searchable or tok in header_blob for tok in tokens):
                 continue
+
+            meta.match_evidence = match_evidence(meta, turns, notes, q)
 
             # Rank literal matches, then break ties by recency.
             dialogue_blob = "\n".join(
@@ -734,6 +823,27 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
     return [(m, t, n) for _, m, t, n in results[:limit]]
 
 
+def match_evidence(meta, turns, notes, query):
+    keyword = query.lower()
+    fields = [("title", meta.title), ("workspace", meta.cwd), ("identity", f"{meta.uid} {meta.raw_id} {meta.agent}")]
+    for turn in turns:
+        fields.append((f"user, Turn {turn.index}", turn.user_text))
+        fields.extend((f"assistant, Turn {turn.index}", text) for text in turn.assistant_texts)
+        fields.extend((f"tool summary, Turn {turn.index}", text) for text in turn.tool_summaries)
+        fields.extend((f"tool output, Turn {turn.index}", text) for text in turn.tool_outputs)
+        fields.extend((f"error, Turn {turn.index}", text) for text in turn.errors)
+    fields.extend(("session note", note) for note in notes)
+    for label, text in fields:
+        if keyword in text.lower():
+            return f"{label}: {one_line(match_excerpt(text, query, 80), 200)}"
+    # Multi-word queries can match words in separate fields.
+    labels = []
+    for token in query.lower().split():
+        label = next((label for label, text in fields if token in text.lower()), "retained content")
+        labels.append(f"{token}: {label}")
+    return "words matched across fields (not an exact quote): " + one_line("; ".join(labels), 200)
+
+
 def render_candidates_table(items: list[tuple[SessionMeta, list[Turn], list[str]]]) -> str:
     lines = ["## Recent / Matching Sessions (Global across all agents)"]
     for idx, (m, turns, _) in enumerate(items, 1):
@@ -741,7 +851,7 @@ def render_candidates_table(items: list[tuple[SessionMeta, list[Turn], list[str]
         last_u = one_line(turns[-1].user_text, 70) if turns else ""
         lines.append(
             f"{idx}. `{m.uid}` | {m.agent} | {fmt_ts(m.mtime)} | turns={len(turns)} | {label} | cwd=`{m.cwd or '-'}`\n"
-            f"   last prompt: {last_u}"
+            f"   last prompt: {last_u}\n   match: {m.match_evidence}"
         )
     return "\n".join(lines)
 
@@ -759,12 +869,7 @@ def render_session_overview(meta: SessionMeta, turns: list[Turn], notes: list[st
         out.append(f"- status: `{meta.status}`")
     out.append(f"- source_file: `{meta.path}`")
     out.append(f"- total_turns: {len(turns)}")
-
-    # 1. Full User Prompts Outline (every user prompt across the entire conversation!)
-    out.append(f"\n## All User Prompts Outline (1..{len(turns)})")
-    for t in turns:
-        err_tag = " [ERR]" if t.errors else ""
-        out.append(f"- [Turn {t.index}] ({t.timestamp}){err_tag}: {one_line(t.user_text, 160)}")
+    out.append("- view_scope: shortened overview, not full dialogue or raw logs")
 
     # 2. Background / Task notes (if any)
     if notes:
@@ -792,10 +897,17 @@ def render_session_overview(meta: SessionMeta, turns: list[Turn], notes: list[st
         if t.errors:
             out.append("**Errors**:\n" + "\n".join(f"- {e}" for e in t.errors[-5:]))
 
+    # 1. Full User Prompts Outline (every user prompt across the entire conversation!)
+    out.append(f"\n## All User Prompts Outline (1..{len(turns)})")
+    for t in turns:
+        err_tag = " [ERR]" if t.errors else ""
+        out.append(f"- [Turn {t.index}] ({t.timestamp}){err_tag}: {one_line(t.user_text, 160)}")
+
+
     out.append(
         f"\n---\nNeed earlier or full dialogue? Run:\n"
         f"- Full read-through: `python3 {pathlib.Path(__file__).resolve()} read {meta.uid} --all`\n"
-        f"- Specific turns:    `python3 {pathlib.Path(__file__).resolve()} read {meta.uid} --turns 1-{min(15, len(turns))}`\n"
+        f"- Specific turns:    `python3 {pathlib.Path(__file__).resolve()} read {meta.uid} --turns 1-{max(1, min(15, len(turns)))}`\n"
         f"- Search in session: `python3 {pathlib.Path(__file__).resolve()} read {meta.uid} --grep \"<keyword>\"`"
     )
     return "\n".join(out)
@@ -811,6 +923,7 @@ def render_read_turns(
     max_chars: int,
     notes: list[str] | None = None,
 ) -> str:
+    """Build a decoded view; CLI pagination enforces the output budget."""
     out: list[str] = [f"# Session `{meta.uid}` ({meta.agent}) — {meta.title or meta.cwd or meta.raw_id}"]
 
     if grep_kw:
@@ -855,8 +968,6 @@ def render_read_turns(
             e_idx = int(m.group(2)) if m.group(2) else s_idx
             selected = [t for t in turns if s_idx <= t.index <= e_idx]
 
-    total_chars = 0
-    stopped_at: int | None = None
     for t in selected:
         block_lines = [f"\n### Turn {t.index} ({t.timestamp})"]
         block_lines.append(f"**User**:\n{t.user_text}")
@@ -871,17 +982,8 @@ def render_read_turns(
             block_lines.append("**Errors**: " + "; ".join(t.errors[-3:]))
 
         block = "\n".join(block_lines)
-        if total_chars + len(block) > max_chars and total_chars > 0:
-            stopped_at = t.index
-            break
         out.append(block)
-        total_chars += len(block)
 
-    if stopped_at is not None:
-        out.append(
-            f"\n---\n[Output capped at {max_chars} chars before Turn {stopped_at}/{len(turns)}. "
-            f"Continue full read-through with: `--turns {stopped_at}-{len(turns)}`]"
-        )
     return "\n".join(out)
 
 
@@ -889,67 +991,118 @@ def render_read_turns(
 # CLI Entrypoint
 # ---------------------------------------------------------------------------
 
+def session_fingerprint(meta, turns, notes, content=""):
+    value = {"session_id": f"{meta.agent}:{meta.raw_id}", "title": meta.title,
+             "cwd": meta.cwd, "path": str(meta.path), "status": meta.status, "mtime": meta.mtime,
+             "turns": [asdict(turn) for turn in turns], "notes": notes,
+             "renderer_version": 1, "parse_warnings": meta.parse_warnings,
+             "rendered_view_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] in ("read", "show"):
-        show_overview = argv[0] == "show"
-        p = argparse.ArgumentParser(prog=f"pickup {argv[0]}", description="Read full dialogue, turn range, or grep inside a session.")
-        p.add_argument("session_id", help="Session UID (e.g. antigravity:942f0a64) or raw ID prefix")
-        p.add_argument("--tail", type=int, default=4, help="Number of recent turns in show (default: 4)")
-        p.add_argument("--all", action="store_true", help="Read full dialogue from Turn 1 onwards (paginated by --max-chars)")
-        p.add_argument("--turns", help="Turn number or inclusive range, e.g. 5-15 or 12")
-        p.add_argument("--grep", help="Search keyword across all dialogue, tool commands, and tool outputs in this session")
-        p.add_argument("--with-tools", action="store_true", help="Include raw tool output snippets alongside dialogue")
-        p.add_argument("--max-chars", type=int, default=60000, help="Max output characters per call (default: 60000)")
-        args = p.parse_args(argv[1:])
-
-        if args.tail < 1 or args.max_chars < 1:
-            p.error("--tail and --max-chars must be positive")
-        if args.turns and not re.fullmatch(r"[1-9]\d*(?:-[1-9]\d*)?", args.turns):
-            p.error("--turns must be a positive turn number or range")
-        if args.turns and "-" in args.turns and int(args.turns.split("-")[0]) > int(args.turns.split("-")[1]):
-            p.error("--turns range must be ascending")
-        all_metas = discover_all()
+        operation = argv[0]
+        parser = argparse.ArgumentParser(prog=f"pickup {operation}", description="Read a bounded decoded view. Follow its cursor until complete=yes; this does not export raw logs.")
+        parser.add_argument("session_id", help="Session UID or full ID")
+        parser.add_argument("--max-chars", type=int, default=pickup_paging.DEFAULT_MAX_CHARS,
+                            help="Entire stdout page budget, including continuation metadata (default: 12000; minimum: 1024)")
+        parser.add_argument("--cursor", help="Resume a page; restores its original view options. Changed sessions require a restart.")
+        if operation == "show":
+            parser.add_argument("--tail", type=int, help="Recent turns in the shortened overview (default: 4)")
+        else:
+            group = parser.add_mutually_exclusive_group()
+            group.add_argument("--all", action="store_true", default=None, help="Read decoded dialogue from the beginning, paginated; not raw-log export")
+            group.add_argument("--turns", help="Positive turn number or inclusive range, e.g. 8-20")
+            group.add_argument("--grep", help="Search retained dialogue/tool excerpts and notes")
+            parser.add_argument("--with-tools", action="store_true", default=None, help="Include retained tool-output snippets")
+        args = parser.parse_args(argv[1:])
         try:
+            if args.max_chars < pickup_paging.MIN_MAX_CHARS:
+                raise ValueError("--max-chars must be at least 1024")
+            supplied = {key: value for key, value in vars(args).items()
+                        if key not in ("session_id", "max_chars", "cursor") and value is not None}
+            if args.cursor:
+                state = pickup_paging.decode_cursor(args.cursor)
+                if state["operation"] != operation:
+                    raise ValueError("Cursor operation differs; restart the selected view")
+                if supplied:
+                    raise ValueError("A cursor restores view options; pass only --cursor and optionally --max-chars")
+                options = state["options"]
+            elif operation == "show":
+                options = {"tail": args.tail if args.tail is not None else 4}
+            else:
+                options = {"all": bool(args.all), "turns": args.turns, "grep": args.grep,
+                           "with_tools": bool(args.with_tools)}
+            if operation == "show":
+                if set(options) != {"tail"} or type(options["tail"]) is not int or options["tail"] < 1:
+                    raise ValueError("Invalid overview options; --tail must be positive")
+            else:
+                if set(options) != {"all", "turns", "grep", "with_tools"} or any(type(options[k]) is not bool for k in ("all", "with_tools")):
+                    raise ValueError("Invalid dialogue view options")
+                for key in ("turns", "grep"):
+                    if options[key] is not None and not isinstance(options[key], str):
+                        raise ValueError("Invalid dialogue view options")
+                if sum(bool(options[k]) for k in ("all", "turns", "grep")) > 1:
+                    raise ValueError("Choose only one of --all, --turns, or --grep")
+                turn_range = options["turns"]
+                if turn_range is not None and not re.fullmatch(r"[1-9]\d*(?:-[1-9]\d*)?", turn_range):
+                    raise ValueError("--turns must be a positive number or range")
+                if turn_range and "-" in turn_range and int(turn_range.split("-")[0]) > int(turn_range.split("-")[1]):
+                    raise ValueError("--turns range must be ascending")
+                if options["grep"] is not None and not options["grep"].strip():
+                    raise ValueError("--grep must not be empty")
+            source = args.session_id.partition(":")[0]
+            all_metas = discover_all([source] if source in AGENTS else None)
             meta = resolve_by_id(all_metas, args.session_id)
+            if not meta:
+                raise ValueError("Session not found; check the selected source or full ID")
+            turns, notes = parse_session(meta, use_full=True)
+            if meta.status == "UNREADABLE":
+                raise ValueError("Session could not be read; resolve its source error before retrying")
+            if not turns and not notes:
+                raise ValueError("Session has no readable decoded content")
+            if operation == "show":
+                content = render_session_overview(meta, turns, notes, tail_count=options["tail"])
+            else:
+                content = render_read_turns(meta, turns, options["turns"], not options["turns"] and not options["grep"],
+                                            options["grep"], options["with_tools"], args.max_chars, notes=notes)
+            if meta.parse_warnings:
+                content = "Source decoding: partial; some records or branches were not decoded.\n\n" + content
+            page = pickup_paging.render_page(content, f"{meta.agent}:{meta.raw_id}",
+                        session_fingerprint(meta, turns, notes, content), operation, options,
+                        args.max_chars, args.cursor, command_prefix=[sys.executable, str(pathlib.Path(__file__).resolve())])
         except ValueError as error:
-            p.error(str(error))
-        if not meta:
-            print(f"Session not found: {args.session_id}", file=sys.stderr)
-            return 1
-        turns, notes = parse_session(meta, use_full=True)
-        if show_overview:
-            print(render_session_overview(meta, turns, notes, tail_count=args.tail) if turns or notes else "Session has no readable turns.")
-            return 0
-        read_all = args.all or (not args.turns and not args.grep)
-        print(render_read_turns(meta, turns, args.turns, read_all, args.grep, args.with_tools, args.max_chars, notes=notes))
+            parser.error(str(error))
+        print(page)
         return 0
 
-    p = argparse.ArgumentParser(
-        prog="pickup",
-        description="Find local Antigravity, Codex, Claude Code, Qoder, Pi, Kimi Code, and Devin CLI sessions across directories. Use show <uid> for an overview or read <uid> for dialogue.",
-    )
-    p.add_argument("query", nargs="*", help="Optional verbatim quote, session title, project name, or keyword")
-    p.add_argument("--list", action="store_true", help="List candidates (the default; retained for compatibility)")
-    p.add_argument("--agent", choices=("antigravity", "codex", "claude", "qoder", "pi", "kimi", "devin"), help="Search only this agent when the source is known")
-    p.add_argument("--exclude", action="append", default=[], metavar="ID", help="Exclude an exact full session ID or UID; repeatable")
-    p.add_argument("--limit", type=int, default=6, help="Number of candidates to list (default: 6)")
-    args = p.parse_args(argv)
-
-    query_str = " ".join(args.query).strip() if args.query else None
-    all_metas = discover_all()
-    if args.agent:
-        all_metas = [m for m in all_metas if m.agent == args.agent]
+    parser = argparse.ArgumentParser(prog="pickup", description="Find local agent sessions across directories. show/read use bounded pages; diagnostics and progress go to stderr.")
+    parser.add_argument("query", nargs="*", help="Optional quote, title, project name, or keyword")
+    parser.add_argument("--list", action="store_true", help="List candidates (the default; compatibility flag)")
+    parser.add_argument("--agent", choices=AGENTS, help="Discover and search only this source")
+    parser.add_argument("--exclude", action="append", default=[], metavar="ID", help="Exclude an exact full ID or UID; repeatable")
+    parser.add_argument("--limit", type=int, default=6, help="Candidate count (default: 6)")
+    args = parser.parse_args(argv)
     if args.limit < 1:
-        p.error("--limit must be positive")
-    matches = find_matching_sessions(all_metas, query_str, limit=args.limit, excluded=set(args.exclude))
-
+        parser.error("--limit must be positive")
+    query = " ".join(args.query).strip() or None
+    report = ScanReport([args.agent] if args.agent else AGENTS)
+    metas = discover_all([args.agent] if args.agent else None, report=report)
+    matches = find_matching_sessions(metas, query, args.limit, set(args.exclude), report=report)
+    status = report.finish()
     if not matches:
-        print(f"No matching local sessions found for query: {query_str!r}")
+        print(f"Scan coverage: {status}.")
+        if not metas:
+            print("No local sessions discovered. Check the source paths and diagnostics above; absent stores differ from failed discovery.")
+        else:
+            print("No matching readable sessions found. Check the query, exclusions, and scan coverage; cloud-only history is not searched.")
         return 1
-
     print(render_candidates_table(matches))
-    print("\nNo session loaded. Select a UID, then run: pickup show <uid>")
+    print(f"\nScan coverage: {status}. Candidate ranking is not proof of original authorship or exhaustive coverage.")
+    print("No session loaded. Select a UID, then run: pickup show <uid>")
     return 0
 
 

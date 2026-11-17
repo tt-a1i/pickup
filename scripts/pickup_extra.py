@@ -1,5 +1,7 @@
 """Readers for locally stored Kimi Code and Devin CLI conversations."""
 import datetime as dt
+import os
+from contextlib import closing
 import json
 import sqlite3
 from pathlib import Path
@@ -11,7 +13,7 @@ def _time(value):
         if isinstance(value, (int, float)):
             return dt.datetime.fromtimestamp(value / 1000 if value > 100000000000 else value).strftime('%Y-%m-%d %H:%M')
         return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d %H:%M')
-    except (ValueError, TypeError, OSError, OverflowError):
+    except (ValueError, TypeError, AttributeError, OSError, OverflowError):
         return ''
 
 
@@ -37,29 +39,65 @@ def _tool(call):
     return f'{name}({args[:90]})' if args else str(name)
 
 
-def discover_kimi(root=None):
+def discover_kimi(root=None, on_error=None):
     root = Path(root) if root is not None else Path.home() / '.kimi-code' / 'sessions'
     found = []
-    for state in root.glob('wd_*/session_*/state.json'):
+
+    def report(reason):
+        if on_error:
+            on_error('kimi', reason)
+
+    def directories(path, prefix):
         try:
-            obj = json.loads(state.read_text())
-            wire = state.parent / 'agents' / 'main' / 'wire.jsonl'
-            if not wire.is_file():
+            with os.scandir(path) as entries:
+                return [Path(entry.path) for entry in entries
+                        if entry.name.startswith(prefix) and entry.is_dir()]
+        except FileNotFoundError:
+            return []
+        except OSError:
+            report('Cannot read session directory')
+            return []
+
+    for workdir in directories(root, 'wd_'):
+        for session in directories(workdir, 'session_'):
+            state = session / 'state.json'
+            try:
+                obj = json.loads(state.read_text(encoding='utf-8'))
+                if not isinstance(obj, dict):
+                    raise ValueError('state must be an object')
+            except (ValueError, UnicodeError):
+                report('Malformed session metadata')
                 continue
-            found.append(dict(raw_id=str(obj.get('id') or state.parent.name.removeprefix('session_')), path=str(state.parent), mtime=wire.stat().st_mtime, cwd=obj.get('cwd') or '', title=obj.get('title') or ''))
-        except (OSError, ValueError, TypeError):
-            continue
+            except OSError:
+                report('Cannot read session metadata')
+                continue
+            wire = session / 'agents' / 'main' / 'wire.jsonl'
+            try:
+                info = wire.stat()
+                if not wire.is_file():
+                    continue
+                found.append(dict(raw_id=str(obj.get('id') or session.name.removeprefix('session_')), path=str(session), mtime=info.st_mtime, cwd=obj.get('cwd') or '', title=obj.get('title') or ''))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                report('Cannot inspect session transcript')
     return found
 
 
-def parse_kimi(path):
+def parse_kimi(path, on_error=None):
     wire = Path(path) / 'agents' / 'main' / 'wire.jsonl'
     turns = []
     with wire.open(encoding='utf-8') as stream:
         for line in stream:
+            if not line.strip():
+                continue
             try:
                 event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError('record must be an object')
             except (ValueError, TypeError):
+                if on_error:
+                    on_error('kimi', 'Malformed transcript record')
                 continue
             if event.get('type') != 'agent.message.appended':
                 continue
@@ -83,23 +121,31 @@ def _db(path):
     return sqlite3.connect('file:' + quote(str(Path(path).resolve())) + '?mode=ro', uri=True)
 
 
-def discover_devin(db=None):
+def discover_devin(db=None, on_error=None):
     db = Path(db) if db is not None else Path.home() / '.local' / 'share' / 'devin' / 'cli' / 'sessions.db'
-    if not db.is_file():
+    try:
+        db.stat()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        if on_error:
+            on_error('devin', 'Cannot inspect session database')
         return []
     try:
-        with _db(db) as conn:
+        with closing(_db(db)) as conn:
             rows = conn.execute('SELECT id, working_directory, title, last_activity_at FROM sessions WHERE hidden = 0').fetchall()
         return [dict(raw_id=str(sid), path=f'{db}#{sid}', mtime=float(ts or 0), cwd=cwd or '', title=title or '') for sid, cwd, title, ts in rows]
     except (sqlite3.Error, OSError, ValueError):
+        if on_error:
+            on_error('devin', 'Cannot read session database or its schema')
         return []
 
 
-def parse_devin(path):
+def parse_devin(path, on_error=None):
     db, sep, sid = str(path).rpartition('#')
     if not sep or not db or not sid:
         raise ValueError('Devin session path must include database path and session ID')
-    with _db(db) as conn:
+    with closing(_db(db)) as conn:
         row = conn.execute('SELECT main_chain_id FROM sessions WHERE id = ?', (sid,)).fetchone()
         if row is None:
             raise ValueError('Devin session not found')
@@ -112,11 +158,17 @@ def parse_devin(path):
         parent, raw, created = nodes[current]
         chain.append((raw, created))
         current = parent
+    if on_error and ((row[0] is None and nodes) or (current is not None and (current not in nodes or current in seen))):
+        on_error('devin', 'Active message chain is missing or cyclic')
     turns = []
     for raw, created in reversed(chain):
         try:
             message = json.loads(raw)
+            if not isinstance(message, dict):
+                raise ValueError('message must be an object')
         except (ValueError, TypeError):
+            if on_error:
+                on_error('devin', 'Malformed message record')
             continue
         role, text = message.get('role'), _text(message.get('content'))
         meta = message.get('metadata') or {}

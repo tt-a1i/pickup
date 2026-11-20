@@ -42,7 +42,7 @@
 | 工具 | 默认本地记录位置 | 读取范围与细节 |
 | :--- | :--- | :--- |
 | **Antigravity** | `~/.gemini/antigravity/brain/` | 优先完整主会话 transcript 与近期后台任务日志 |
-| **Codex** | `~/.codex/sessions/` | 主会话 JSONL（自动过滤注入的系统提示块） |
+| **Codex** | `~/.codex/sessions/`、`~/.codex/archived_sessions/` | 主会话 JSONL 和 `.jsonl.zst`，保留带附件的用户正文与图片引用 |
 | **Claude Code** | `~/.claude/projects/` | 项目主会话 JSONL（兼容文本块数组形式的工具结果） |
 | **Qoder** | `~/.qoder/projects/`、`~/.qoder-cn/projects/`、`~/.qoderwork/projects/` | 项目会话 JSONL（支持国际版、国内版与 QoderWork） |
 | **Pi** | `~/.pi/agent/sessions/` | 按最后持久化节点的父链还原当前分支，保留该路径上的早期对话 |
@@ -55,7 +55,7 @@
 
 ## 快速安装
 
-需要 **Python 3.10+**，运行时零第三方依赖。
+需要 **Python 3.10+**。读取 Zstandard 压缩的 Codex 记录需要 Python 3.14 的标准库或系统上的 `zstd` 命令。
 
 ### 1. 克隆仓库并验证 CLI
 
@@ -127,9 +127,10 @@ python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 ```bash
 python3 scripts/pickup.py show '<uid>'
 python3 scripts/pickup.py show '<uid>' --tail 2
+python3 scripts/pickup.py show 'codex://threads/<完整会话ID>'
 ```
 
-输出包含用户提问的缩略大纲（`Turn 1..N`）、最近几轮的缩略对话、紧凑的工具调用轨迹与可用的错误/后台任务日志。
+输出包含用户提问的缩略大纲（`Turn 1..N`）、最近几轮的缩略对话、紧凑的工具调用轨迹与可用的错误/后台任务日志。如果多个文件记录了同一个会话 ID，使用候选或错误提示里带有 `@` 后缀的记录 UID 打开对应文件。
 
 ### 第三步：按需深读或全文通读（`read`）
 
@@ -149,7 +150,17 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 
 `show` 和 `read` 默认每页最多 12,000 字符，可用 `--max-chars` 调整（最小 1,024）。检查输出末尾的 `complete=yes/no` 和 `view`；如未完成，运行给出的续读命令，直到该视图显示 `complete=yes`。游标会恢复原来的筛选选项；如果源内容已变化导致游标失效，请重新开始该视图。避免用 `head` 截断输出，否则可能丢失续读信息。
 
-完成标记只表示所选视图读完：`show` 是缩略概览，`read` 是对话和工具摘要，`--with-tools` 也只包含工具输出片段。这些不等于完整原始日志；需要原始记录时请核查来源路径。
+完成标记只覆盖所选视图。`show` 是缩略概览，`read` 是对话和工具摘要，`--with-tools` 补充工具输出片段。续读命令保留设置的页面大小。
+
+### 第四步：保存到文件（`export`）
+
+```bash
+python3 scripts/pickup.py export '<uid>' --output ~/Downloads/dialogue.md
+python3 scripts/pickup.py export '<uid>' --turns 8-10 --turns 15 --output ~/Downloads/selected.md
+python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/session.jsonl
+```
+
+Markdown 导出包含完整的解码对话和工具摘要，可加 `--with-tools` 保存工具输出片段。原始导出复制所选记录的字节，请沿用源文件扩展名，压缩记录用 `.jsonl.zst`。Kimi Code 导出主 Agent 的 wire 日志，Devin CLI 导出所选会话的消息节点和当前分支指针。导出需要填写一个新文件路径。
 
 ### 在聊天窗口直接调用
 

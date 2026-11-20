@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ class CliTests(unittest.TestCase):
                 'content': [{'type': 'input_text' if role == 'user' else 'output_text', 'text': text}]}}
 
     def write(self, rows):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         rows = [{'type': 'session_meta', 'payload': {'id': self.sid, 'cwd': '/fixture'}}] + rows
         self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=True) for row in rows))
 
@@ -170,6 +172,93 @@ class CliTests(unittest.TestCase):
         result = self.run_cli('--agent', 'codex', 'accompanying-request')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('user, Turn 1', result.stdout)
+
+    def test_attached_request_is_read_and_searchable_without_attachment_header(self):
+        request = self.message('user', '# Files mentioned by the user:\n\n## Sample file\n'
+                               'attachment-metadata\n\n## My request:\n截图里是哪段会话？')
+        request['payload']['content'].extend([
+            {'type': 'input_text', 'text': '<image name="Image #1" path="/tmp/attachment file.png">'},
+            {'type': 'input_image', 'image_url': 'data:image/png;base64,secret-bytes'},
+            {'type': 'input_text', 'text': '</image>'},
+        ])
+        self.write([request, self.message('assistant', '这是原始日志')])
+        found = self.run_cli('--agent', 'codex', '截图里是哪段会话')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        view = self.run_cli('read', self.sid)
+        self.assertEqual(view.returncode, 0, view.stderr)
+        self.assertIn('**User**:\n截图里是哪段会话？', view.stdout)
+        self.assertIn('[Image attachment: /tmp/attachment file.png]', view.stdout)
+        self.assertNotIn('secret-bytes', view.stdout)
+        self.assertNotIn('attachment-metadata', view.stdout)
+
+    def test_same_codex_id_in_active_and_archive_has_a_round_trip_selector(self):
+        self.sid = '12345678-1234-1234-1234-123456789abc'
+        self.write([self.message('user', 'other record')])
+        self.path = self.home / '.codex/archived_sessions/other.jsonl'
+        self.write([self.message('user', 'archived request'), self.message('assistant', 'original needle' + 'z' * 4000)])
+        found = self.run_cli('--agent', 'codex', 'original needle')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        uid = re.search(r'`(codex:[^ `]+@[^ `]+)`', found.stdout)[1]
+        self.assertIn('source=archived_sessions', found.stdout)
+        show = self.run_cli('show', uid)
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn('archived request', show.stdout)
+        view = self.run_cli('read', uid, '--max-chars', '2000')
+        self.assertEqual(view.returncode, 0, view.stderr)
+        resume = self.run_cli('read', uid, '--cursor', self.cursor(view.stdout))
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertIn('complete=yes', resume.stdout)
+        ambiguous = self.run_cli('show', f'codex://threads/{self.sid}')
+        self.assertNotEqual(ambiguous.returncode, 0)
+        self.assertIn(uid, ambiguous.stderr)
+
+    @unittest.skipUnless(pickup.zstd is not None or shutil.which('zstd'), 'Zstandard reader unavailable')
+    def test_archive_compressed_link_and_file_exports(self):
+        self.sid = '12345678-1234-1234-1234-123456789abc'
+        self.path = self.home / '.codex/archived_sessions/archived.jsonl'
+        ending = 'late-dialogue-marker'
+        self.write([self.message('user', 'archived request'),
+                    self.message('assistant', '长对话\n' * 4000 + ending)])
+        packed = self.path.with_suffix('.jsonl.zst')
+        if pickup.zstd is not None:
+            packed.write_bytes(pickup.zstd.compress(self.path.read_bytes()))
+        else:
+            subprocess.run(['zstd', '-q', str(self.path)], check=True, timeout=10)
+        self.path.unlink()
+        link = f'[Archived chat](codex://threads/{self.sid})'
+        candidate = self.run_cli(link)
+        self.assertEqual(candidate.returncode, 0, candidate.stderr)
+        self.assertIn('session identifier matched', candidate.stdout)
+        markdown = self.home / 'dialogue 中文.md'
+        out = self.run_cli('export', link, '--output', str(markdown))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(ending, markdown.read_text())
+        raw = self.home / 'record.jsonl.zst'
+        out = self.run_cli('export', link, '--format', 'raw', '-o', str(raw))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(raw.read_bytes(), packed.read_bytes())
+        collision = self.run_cli('export', link, '--format', 'raw', '-o', str(markdown))
+        self.assertNotEqual(collision.returncode, 0)
+        self.assertIn(ending, markdown.read_text())
+
+    def test_export_selected_ranges_omits_unrelated_turns_and_deduplicates(self):
+        self.write([self.message('user', f'question-{i}') for i in range(1, 7)])
+        out = self.home / 'selected.md'
+        result = self.run_cli('export', self.sid, '--turns', '5-6', '--turns', '2', '--turns', '6',
+                              '--output', str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = out.read_text()
+        self.assertEqual(re.findall(r'^### Turn (\d+)', text, re.MULTILINE), ['2', '5', '6'])
+        self.assertNotIn('question-3', text)
+        bad = self.home / 'invalid.md'
+        result = self.run_cli('export', self.sid, '--turns', '99', '--output', str(bad))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(bad.exists())
+        self.assertIn('this session has 6 turns', result.stderr)
+        result = self.run_cli('export', self.sid, '--turns', '5-7', '--output', str(bad))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(bad.exists())
+        self.assertIn('exceeds the last turn (6)', result.stderr)
 
     def test_broken_source_is_partial_and_bad_cursor_has_no_output(self):
         self.write([self.message('user', 'needle')])

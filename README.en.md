@@ -42,7 +42,7 @@ You explored an architecture in **Antigravity** and want **Codex** to implement 
 | Agent | Default Local Store | What `pickup` Reads |
 | :--- | :--- | :--- |
 | **Antigravity** | `~/.gemini/antigravity/brain/` | Full main-session transcript + recent background task logs |
-| **Codex** | `~/.codex/sessions/` | Main-session JSONL (filters injected system prompt blocks) |
+| **Codex** | `~/.codex/sessions/`, `~/.codex/archived_sessions/` | Main-session JSONL and `.jsonl.zst`, including user text and image references in attachment messages |
 | **Claude Code** | `~/.claude/projects/` | Project main-session JSONL (supports array-of-text-blocks tool results) |
 | **Qoder** | `~/.qoder/projects/`, `~/.qoder-cn/projects/`, `~/.qoderwork/projects/` | Project session JSONL (Global, CN, and QoderWork editions) |
 | **Pi** | `~/.pi/agent/sessions/` | Reconstructs active branch via last persisted parent chain, keeping earlier turns along the path |
@@ -55,7 +55,7 @@ You explored an architecture in **Antigravity** and want **Codex** to implement 
 
 ## Installation
 
-Requires **Python 3.10+** with zero external runtime dependencies.
+Requires **Python 3.10+**. Reading Zstandard-compressed Codex records requires Python 3.14's standard library or the system `zstd` command.
 
 ### 1. Clone and verify the CLI
 
@@ -125,9 +125,10 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 ```bash
 python3 scripts/pickup.py show '<uid>'
 python3 scripts/pickup.py show '<uid>' --tail 2
+python3 scripts/pickup.py show 'codex://threads/<full-session-id>'
 ```
 
-Returns a compact outline of **user prompts (`Turn 1..N`)**, plus shortened recent turns, tool call trails, and available errors or background task logs.
+Returns a compact outline of **user prompts (`Turn 1..N`)**, plus shortened recent turns, tool call trails, and available errors or background task logs. When several files share a session ID, use the record UID with an `@` suffix from the candidate list or ambiguity message.
 
 ### 3. Read deeper on demand (`read`)
 
@@ -147,7 +148,17 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 
 `show` and `read` default to at most 12,000 characters per page; use `--max-chars` to adjust it (minimum 1,024). Check the final `complete=yes/no` and `view` markers, and run each continuation command until that view reports `complete=yes`. The cursor restores the original filters; if a changed source invalidates it, restart that view. Avoid truncating the output with `head`, which can hide continuation information.
 
-Completion applies only to the selected view: `show` is a shortened overview, `read` contains dialogue and tool summaries, and `--with-tools` includes snippets of tool output. These are not complete raw logs; check the source path when raw records are needed.
+Completion applies only to the selected view. `show` gives an overview, `read` contains dialogue and tool summaries, and `--with-tools` includes snippets of tool output. The continuation command preserves a custom page size.
+
+### 4. Export to a file (`export`)
+
+```bash
+python3 scripts/pickup.py export '<uid>' --output ~/Downloads/dialogue.md
+python3 scripts/pickup.py export '<uid>' --turns 8-10 --turns 15 --output ~/Downloads/selected.md
+python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/session.jsonl
+```
+
+Markdown export saves the full decoded dialogue and tool summaries. Add `--with-tools` for output snippets. Raw export copies the selected file's bytes. Keep the original extension, such as `.jsonl.zst` for compressed sources. For Kimi Code, the source is the main agent's wire log. For Devin CLI, the raw export is JSONL with the selected session's message nodes and active branch pointer. Choose a new output path.
 
 ### Using `/pickup` in chat
 

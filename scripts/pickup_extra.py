@@ -141,24 +141,42 @@ def discover_devin(db=None, on_error=None):
         return []
 
 
-def parse_devin(path, on_error=None):
+def _devin_session_rows(path):
     db, sep, sid = str(path).rpartition('#')
     if not sep or not db or not sid:
         raise ValueError('Devin session path must include database path and session ID')
     with closing(_db(db)) as conn:
+        conn.execute('BEGIN')
         row = conn.execute('SELECT main_chain_id FROM sessions WHERE id = ?', (sid,)).fetchone()
         if row is None:
             raise ValueError('Devin session not found')
-        # Only ancestors of the active head belong to the active conversation.
-        rows = conn.execute('SELECT node_id, parent_node_id, chat_message, created_at FROM message_nodes WHERE session_id = ?', (sid,)).fetchall()
+        rows = conn.execute(
+            'SELECT node_id, parent_node_id, chat_message, created_at FROM message_nodes WHERE session_id = ?',
+            (sid,),
+        ).fetchall()
+    return sid, row[0], rows
+
+
+def export_devin_records(path, stream):
+    sid, head, rows = _devin_session_rows(path)
+    records = [{'type': 'session', 'session_id': sid, 'main_chain_id': head}]
+    records.extend(dict(type='message_node', node_id=node, parent_node_id=parent,
+                        chat_message=raw, created_at=created) for node, parent, raw, created in rows)
+    for record in records:
+        stream.write((json.dumps(record, ensure_ascii=False) + '\n').encode('utf-8'))
+
+
+def parse_devin(path, on_error=None):
+    _, head, rows = _devin_session_rows(path)
+    # Only ancestors of the active head belong to the active conversation.
     nodes = {node: (parent, raw, created) for node, parent, raw, created in rows}
-    chain, seen, current = [], set(), row[0]
+    chain, seen, current = [], set(), head
     while current is not None and current in nodes and current not in seen:
         seen.add(current)
         parent, raw, created = nodes[current]
         chain.append((raw, created))
         current = parent
-    if on_error and ((row[0] is None and nodes) or (current is not None and (current not in nodes or current in seen))):
+    if on_error and ((head is None and nodes) or (current is not None and (current not in nodes or current in seen))):
         on_error('devin', 'Active message chain is missing or cyclic')
     turns = []
     for raw, created in reversed(chain):

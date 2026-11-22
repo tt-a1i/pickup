@@ -87,6 +87,7 @@ class SessionMeta:
     metadata_only: bool = False
     match_turn: int = 0
     models: set[str] = field(default_factory=set)
+    is_subagent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +166,7 @@ def jsonl_lines(path):
 # Store 1: Antigravity (~/.gemini/antigravity)
 # ---------------------------------------------------------------------------
 
-def discover_antigravity(on_error=None) -> list[SessionMeta]:
+def discover_antigravity(on_error=None, *, include_subagents=False) -> list[SessionMeta]:
     base = HOME / ".gemini" / "antigravity"
     brain = base / "brain"
     if not base.is_dir():
@@ -186,7 +187,7 @@ def discover_antigravity(on_error=None) -> list[SessionMeta]:
             for cid, title, ws_raw, status, parent_id, modified in rows:
                 if not cid:
                     continue
-                if parent_id:
+                if parent_id and not include_subagents:
                     subagents.add(cid)
                     continue
                 workspace = re.search(r"file://([^\s\"'\],]+)", str(ws_raw or ""))
@@ -198,6 +199,7 @@ def discover_antigravity(on_error=None) -> list[SessionMeta]:
                     f"antigravity:{cid[:8]}", "antigravity", cid, db_path, mtime,
                     cwd=workspace[1] if workspace else "", title=title or "",
                     status=(status or "").replace("CASCADE_RUN_STATUS_", ""), metadata_only=True,
+                    is_subagent=bool(parent_id),
                 )
         except (OSError, sqlite3.Error, ValueError, TypeError):
             if on_error:
@@ -380,7 +382,7 @@ def codex_roots():
     return [HOME / ".codex" / store for store in ("sessions", "archived_sessions")]
 
 
-def discover_codex(on_error=None) -> list[SessionMeta]:
+def discover_codex(on_error=None, *, include_subagents=False) -> list[SessionMeta]:
     out: list[SessionMeta] = []
     files = (path for root in codex_roots() for path in root.rglob("*.jsonl*")
              if path.name.endswith((".jsonl", ".jsonl.zst")))
@@ -415,7 +417,7 @@ def discover_codex(on_error=None) -> list[SessionMeta]:
                 on_error("codex", "session metadata could not be read")
             continue
 
-        if is_subagent:
+        if is_subagent and not include_subagents:
             continue
 
         out.append(
@@ -427,6 +429,7 @@ def discover_codex(on_error=None) -> list[SessionMeta]:
                 mtime=st.st_mtime,
                 cwd=cwd,
                 location=f.relative_to(HOME / ".codex").parts[0],
+                is_subagent=is_subagent,
             )
         )
     if skipped_compressed and on_error:
@@ -745,7 +748,7 @@ def parse_pi_turns(meta: SessionMeta) -> tuple[list[Turn], list[str]]:
 AGENTS = ("antigravity", "codex", "claude", "qoder", "pi", "kimi", "devin")
 
 
-def discover_all(agents=None, report=None) -> list[SessionMeta]:
+def discover_all(agents=None, report=None, *, include_subagents=False) -> list[SessionMeta]:
     selected = AGENTS if agents is None else agents
     roots = {
         "antigravity": [HOME / ".gemini/antigravity/brain", HOME / ".gemini/antigravity/conversation_summaries.db"],
@@ -762,8 +765,11 @@ def discover_all(agents=None, report=None) -> list[SessionMeta]:
         else:
             print(f"Discovery failed [{agent}]: {reason}", file=sys.stderr)
     loaders = {
-        "antigravity": lambda: discover_antigravity(on_error=(lambda ag, why: report.warning(ag, why)) if report else None),
-        "codex": lambda: discover_codex(on_error=diagnostic),
+        "antigravity": lambda: discover_antigravity(
+            on_error=(lambda ag, why: report.warning(ag, why)) if report else None,
+            include_subagents=include_subagents,
+        ),
+        "codex": lambda: discover_codex(on_error=diagnostic, include_subagents=include_subagents),
         "claude": lambda: discover_claude_like("claude", roots["claude"]),
         "qoder": lambda: discover_claude_like("qoder", roots["qoder"]),
         "pi": discover_pi,
@@ -944,6 +950,8 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
             rank, meta.match_evidence, meta.match_turn = match
             results.append((rank, meta, turns, notes))
 
+    if q and not by_id:
+        results = rank_reposted_matches(results, q_low)
     results.sort(key=lambda x: (x[0], x[1].mtime), reverse=True)
     return [(m, t, n) for _, m, t, n in results[:limit]]
 
@@ -975,11 +983,14 @@ def search_fields(meta, turns, notes, keyword):
         yield 1, 0, "session note", note
 
 
-def match_evidence(meta, turns, notes, keyword):
+def match_evidence(meta, turns, notes, keyword, reposts=None):
     remaining = dict.fromkeys(keyword.split())
     best = None
     labels = []
     for rank, turn, label, text in search_fields(meta, turns, notes, keyword):
+        if reposts and turn in reposts and rank == 4:
+            rank = 3
+            label = f"{label} in probable repost (earlier match: {reposts[turn]})"
         if best and rank <= best[0]:
             continue
         lower = text.lower()
@@ -1000,6 +1011,58 @@ def match_evidence(meta, turns, notes, keyword):
     return None
 
 
+def passage_windows(text, keyword, compact_keyword, width):
+    if keyword not in text.lower():
+        return
+    compact = re.sub(r"\s+", "", text.lower())
+    if len(compact) < width:
+        return
+    offset = compact.find(compact_keyword)
+    while offset >= 0:
+        end = offset + len(compact_keyword)
+        for start in range(max(0, end - width), min(offset, len(compact) - width) + 1):
+            yield compact[start:start + width]
+        offset = compact.find(compact_keyword, offset + len(compact_keyword))
+
+
+def rank_reposted_matches(results, keyword):
+    if len(results) < 2 or not any(rank == 4 and meta.match_evidence.startswith("user,")
+                                  for rank, meta, _, _ in results):
+        return results
+    compact_keyword = re.sub(r"\s+", "", keyword)
+    # Require a substantial shared passage and context besides the search clue.
+    width = max(64, len(compact_keyword) + 24)
+    origins = {}
+    for _, meta, turns, notes in results:
+        for rank, index, label, text in search_fields(meta, turns, notes, keyword):
+            if rank != 4 or label != "assistant" or not turns[index - 1].timestamp:
+                continue
+            origin = (turns[index - 1].timestamp, meta.agent, meta.raw_id, meta.uid)
+            for window in passage_windows(text, keyword, compact_keyword, width):
+                previous = origins.setdefault(window, origin)
+                if origin < previous:
+                    origins[window] = origin
+    if not origins:
+        return results
+
+    ranked = []
+    for rank, meta, turns, notes in results:
+        if rank == 4 and meta.match_evidence.startswith("user,"):
+            reposts = {}
+            for turn in turns:
+                if not turn.timestamp or PICKUP_REQUEST.match(turn.user_text):
+                    continue
+                for window in passage_windows(turn.user_text, keyword, compact_keyword, width):
+                    origin = origins.get(window)
+                    if origin and origin[0] < turn.timestamp and origin[1:3] != (meta.agent, meta.raw_id):
+                        reposts[turn.index] = origin[3]
+                        break
+            if reposts:
+                rank, meta.match_evidence, meta.match_turn = match_evidence(meta, turns, notes, keyword, reposts=reposts)
+        ranked.append((rank, meta, turns, notes))
+    return ranked
+
+
 def render_candidates_table(items: list[tuple[SessionMeta, list[Turn], list[str]]], query: str | None) -> str:
     lines = ["## Recent / Matching Sessions (Global across all agents)"]
     for idx, (m, turns, _) in enumerate(items, 1):
@@ -1007,6 +1070,7 @@ def render_candidates_table(items: list[tuple[SessionMeta, list[Turn], list[str]
         last_u = one_line(turns[-1].user_text, 70) if turns else ""
         last_prompt = f"   last prompt: {last_u}\n" if last_u else ""
         source = f" | source={m.location}" if m.location else ""
+        kind = " | subagent" if m.is_subagent else ""
         models = f" | models={', '.join(sorted(m.models))}" if m.models else ""
         record = f"\n   record: {m.path.name}" if m.record_variant else ""
         details = "metadata only | transcript unavailable" if m.metadata_only else f"turns={len(turns)}"
@@ -1018,7 +1082,7 @@ def render_candidates_table(items: list[tuple[SessionMeta, list[Turn], list[str]
             open_match = f"\n   open match: {command}"
         updated = fmt_ts(m.mtime) if m.mtime else "unknown date"
         lines.append(
-            f"{idx}. `{m.uid}` | {m.agent} | {updated} | {details} | {label} | cwd=`{m.cwd or '-'}`{source}{models}\n"
+            f"{idx}. `{m.uid}` | {m.agent}{kind} | {updated} | {details} | {label} | cwd=`{m.cwd or '-'}`{source}{models}\n"
             f"{last_prompt}   match: {m.match_evidence}{open_match}{record}"
         )
     return "\n".join(lines)
@@ -1028,6 +1092,8 @@ def render_session_overview(meta: SessionMeta, turns: list[Turn], notes: list[st
     out: list[str] = []
     out.append(f"# Picked Session: `{meta.uid}` ({meta.agent})")
     out.append(f"- full_id: `{meta.raw_id}`")
+    if meta.is_subagent:
+        out.append("- kind: subagent session")
     updated = fmt_ts(meta.mtime) if meta.mtime else "unknown date"
     out.append(f"- updated: {updated}")
     if meta.title:
@@ -1200,7 +1266,7 @@ def session_fingerprint(meta, turns, notes, content=""):
 def load_selected_meta(target):
     target = normalize_session_target(target)
     source = target.partition(":")[0].lower()
-    metas = discover_all([source] if source in AGENTS else None)
+    metas = discover_all([source] if source in AGENTS else None, include_subagents=True)
     meta = resolve_by_id(metas, target)
     if meta is None:
         raise ValueError("Session not found; check the selected source or full ID")
@@ -1362,6 +1428,7 @@ def main() -> int:
     parser.add_argument("--project", metavar="PATH_TEXT", help="Only search workspaces whose paths contain this text")
     parser.add_argument("--since", metavar="YYYY-MM-DD", help="Only search records modified on or after this local date")
     parser.add_argument("--model", metavar="NAME_TEXT", help="Match model names recorded in Codex, Antigravity, Claude Code, or Qoder transcripts")
+    parser.add_argument("--include-subagents", action="store_true", help="Include local Codex and Antigravity subagent sessions")
     parser.add_argument("--exclude", action="append", default=[], metavar="ID", help="Exclude an exact full ID or UID; repeatable")
     parser.add_argument("--limit", type=int, default=6, help="Candidate count (default: 6)")
     args = parser.parse_args(argv)
@@ -1382,7 +1449,7 @@ def main() -> int:
         parser.error("--model is available for Antigravity, Codex, Claude Code, and Qoder")
     sources = (selected,) if selected else (model_sources if model else AGENTS)
     report = ScanReport(sources)
-    metas = discover_all(sources, report=report)
+    metas = discover_all(sources, report=report, include_subagents=args.include_subagents or by_id)
     matches = find_matching_sessions(metas, query, args.limit, set(args.exclude), report=report, by_id=by_id,
                                      project=(args.project or "").strip(), since=since, model=model)
     status = report.finish()

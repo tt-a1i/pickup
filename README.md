@@ -109,6 +109,7 @@ python3 scripts/pickup.py "某个有辨识度的原话片段"
 # 已知来源工具时缩小扫描范围
 python3 scripts/pickup.py --agent kimi
 python3 scripts/pickup.py --agent devin "登录问题"
+python3 scripts/pickup.py --agent codex --include-subagents "审查结论"
 python3 scripts/pickup.py --project archify --since 2026-11-01 --model astra "CI 提速"
 
 # 自定义返回数量，或显式排除当前会话
@@ -120,7 +121,7 @@ python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 - 若运行环境提供受支持的当前会话 ID，脚本会自动排除自身；缺少时可用 `--exclude`。
 - 关键词命中会显示来源角色、轮次和文本片段，帮助判断候选是否符合线索。`--agent` 在发现阶段就限制来源。
 - `--project` 匹配工作区路径，`--since` 匹配本地日期当天或之后修改的记录。对已有工作区路径的会话，这两个筛选可以在读取正文前缩小范围。`--model` 匹配 Codex、Antigravity、Claude Code 和 Qoder 正文里记录的模型名，包含曾切换模型的会话。
-- 标题、工作区名和对话中的原句优先。通过 pickup 提交的线索仍可匹配，排在普通对话的原句之后。候选里的 `open match` 命令可直接打开命中的轮次。
+- 标题、工作区名和对话中的原句优先。如果较晚的用户消息与另一会话较早的助手回复共享一段包含线索的长文字，较晚的匹配会标为 `probable repost` 并降低排序。候选里的 `open match` 命令可打开命中轮次或工具结果片段。
 - `Scan coverage` 的 `partial` 表示存在扫描范围缺口。查看 `failed`、`discovery_failed`、`metadata_only`、`unscanned` 和解析告警。Antigravity 只有元数据时，可用 `show` 查看标题和工作区。读取和导出需要本机有对应的正文记录。
 
 ### 第二步：查看概览与大纲（`show`）
@@ -134,6 +135,8 @@ python3 scripts/pickup.py show 'codex://threads/<完整会话ID>'
 ```
 
 输出包含用户提问的缩略大纲（`Turn 1..N`）、最近几轮的缩略对话、紧凑的工具调用轨迹与可用的错误/后台任务日志。如果多个文件记录了同一个会话 ID，使用候选或错误提示里带有 `@` 后缀的记录 UID 打开对应文件。
+
+本机有记录的 Codex 和 Antigravity 子代理可以通过 ID 或会话链接直接打开。关键词搜索和最近列表默认查看主会话，添加 `--include-subagents` 可以同时查看这两个客户端的子代理。
 
 ### 第三步：按需深读或全文通读（`read`）
 

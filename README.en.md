@@ -109,6 +109,7 @@ python3 scripts/pickup.py "distinctive phrase from the session"
 # Narrow to a specific agent when known
 python3 scripts/pickup.py --agent kimi
 python3 scripts/pickup.py --agent devin "login timeout"
+python3 scripts/pickup.py --agent codex --include-subagents "review findings"
 python3 scripts/pickup.py --project archify --since 2026-11-01 --model astra "CI speed"
 
 # Customize limit or exclude the current session explicitly
@@ -120,7 +121,7 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 - Automatically excludes the active session when the caller runtime supplies its session ID; use `--exclude` otherwise.
 - Keyword matches include the source role, turn and text snippet to help assess candidates. `--agent` limits sources before discovery.
 - `--project` matches workspace paths. `--since` includes records modified on or after the given local date. These filters can skip transcript reads when the relevant metadata is available. `--model` matches names recorded in Codex, Antigravity, Claude Code and Qoder transcripts, including sessions that switched models.
-- Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. Use `open match` to read the matched turn.
+- Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. When a later user message shares a long passage containing the clue with an earlier assistant reply in another session, the later match ranks lower and is labeled `probable repost`. Use `open match` to read the matched turn or tool excerpt.
 - `Scan coverage` goes to stderr. A `partial` status indicates a coverage gap. Check `failed`, `discovery_failed`, `metadata_only`, `unscanned` and any decode warnings. For Antigravity sessions with metadata only, use `show` for the title and workspace. Reading and exporting require a local transcript.
 
 ### 2. Inspect overview & outline (`show`)
@@ -132,6 +133,8 @@ python3 scripts/pickup.py show 'codex://threads/<full-session-id>'
 ```
 
 Returns a compact outline of **user prompts (`Turn 1..N`)**, plus shortened recent turns, tool call trails, and available errors or background task logs. When several files share a session ID, use the record UID with an `@` suffix from the candidate list or ambiguity message.
+
+Open a local Codex or Antigravity subagent session by ID or session link. Keyword searches and recent lists default to main sessions. Add `--include-subagents` to include subagent sessions from those two clients.
 
 ### 3. Read deeper on demand (`read`)
 

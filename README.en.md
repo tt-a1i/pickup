@@ -89,7 +89,7 @@ mkdir -p ~/.gemini/config/skills
 test ! -e ~/.gemini/config/skills/pickup && test ! -L ~/.gemini/config/skills/pickup && ln -s "$PWD" ~/.gemini/config/skills/pickup
 ```
 
-Install separately for each client. For other clients, consult their skill directory instructions. Open a new session and enter `/pickup` to check that the client recognizes the skill and lists candidates. If it does not, check that the target points to the repository containing `SKILL.md` and `scripts/`.
+Install separately for each client. In a new Codex App chat, type `$pickup` and select the skill. In Claude Code or Antigravity, enter `/pickup`. If the skill is missing, check that the link points to the repository containing `SKILL.md` and `scripts/`.
 
 ---
 
@@ -109,6 +109,7 @@ python3 scripts/pickup.py "distinctive phrase from the session"
 # Narrow to a specific agent when known
 python3 scripts/pickup.py --agent kimi
 python3 scripts/pickup.py --agent devin "login timeout"
+python3 scripts/pickup.py --project archify --since 2026-11-01 --model astra "CI speed"
 
 # Customize limit or exclude the current session explicitly
 python3 scripts/pickup.py --limit 10
@@ -118,7 +119,9 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 - **Discovery only — never auto-loads #1**: without a query, candidates sort by file modification time; with a query, matches in parsed titles, summaries, and dialogue outrank tool-output matches.
 - Automatically excludes the active session when the caller runtime supplies its session ID; use `--exclude` otherwise.
 - Keyword matches include the source role, turn and text snippet to help assess candidates. `--agent` limits sources before discovery.
-- Progress and detailed `Scan coverage` go to stderr. `partial` can mean a read failed or that the recent-session list stopped normally after reaching its limit. Check `failed`, `discovery_failed` and `unscanned`; unscanned records are not evidence of no match.
+- `--project` matches workspace paths. `--since` includes records modified on or after the given local date. These filters can skip transcript reads when the relevant metadata is available. `--model` matches names recorded in Codex, Antigravity, Claude Code and Qoder transcripts, including sessions that switched models.
+- Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. Use `open match` to read the matched turn.
+- `Scan coverage` goes to stderr. A `partial` status indicates a coverage gap. Check `failed`, `discovery_failed`, `metadata_only`, `unscanned` and any decode warnings. For Antigravity sessions with metadata only, use `show` for the title and workspace. Reading and exporting require a local transcript.
 
 ### 2. Inspect overview & outline (`show`)
 
@@ -160,12 +163,10 @@ python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/sessi
 
 Markdown export saves the full decoded dialogue and tool summaries. Add `--with-tools` for output snippets. Raw export copies the selected file's bytes. Keep the original extension, such as `.jsonl.zst` for compressed sources. For Kimi Code, the source is the main agent's wire log. For Devin CLI, the raw export is JSONL with the selected session's message nodes and active branch pointer. Choose a new output path.
 
-### Using `/pickup` in chat
+### Using pickup in chat
 
-Once installed as a skill, just type in any new chat:
-
-- **`/pickup`** — lists recent sessions across your machine so you can pick one.
-- **`/pickup read the earlier discussion about login timeouts`** — locates and summarizes the matching thread.
+- **`$pickup`** in Codex App or **`/pickup`** in Claude Code and Antigravity lists recent sessions.
+- Add a clue such as “read the earlier discussion about login timeouts” to find and summarize the matching thread.
 - **Paste a quote or screenshot + `continue from here`** — the agent extracts a distinctive clue, loads the source session, checks live disk files / `git status` if coding, and picks up cleanly.
 
 ---

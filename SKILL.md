@@ -1,6 +1,6 @@
 ---
 name: pickup
-description: Find and read another local AI agent session across projects and tools, including Kimi Code and Devin CLI. Use for /pickup or requests to read or continue a previous session, with an optional quote, title, topic, or screenshot.
+description: Find and read another local AI agent session across projects and tools. Use when the user invokes pickup or asks to find, read, or continue a previous session from a link, quote, title, topic, or screenshot.
 ---
 
 # Pickup
@@ -16,7 +16,7 @@ python3 "<skill-directory>/scripts/pickup.py" "<distinctive phrase, title, or to
 
 Both commands return candidates only. With a session link or ID, use `show <id-or-link>` directly. If multiple records share the ID, use a record UID returned by a search for the distinctive quote or by the ambiguity message. If the source is already known, narrow text search with `--agent`; otherwise keep the cross-tool search. For a screenshot or pasted answer, extract a short distinctive phrase in the original wording. If a command is still running, wait for its output before replying.
 
-Use candidate role, turn, and snippet to assess matches; a quoted copy in a later session may match too. Use the stderr coverage report to explain limits that affect the result, especially a missing match or competing candidates. Once the requested record is verified, lead with the match and what was read. Recent lists and identifier lookups intentionally avoid decoding unrelated records.
+Use candidate role, turn, and snippet to assess matches. Open the matched turn with the command shown in the result. A pasted quote in a later session may match too. Narrow the search with `--project`, `--since`, or `--model` when the user gives those clues. A metadata-only result can identify a session by title or ID, with its transcript unavailable for reading. Use the stderr coverage report to explain limits that affect the result. Once the requested record is verified, lead with the match and what was read.
 
 Select the session supported by the user's clue. If several remain plausible, present a short candidate list and ask which one. With no clue, show recent candidates and ask the user to select; do not load the first candidate merely because it is newest.
 

@@ -68,7 +68,7 @@ class PagingTests(unittest.TestCase):
         self.assertEqual(data['options'], options)
         command = shlex.split(page.split('Next: ')[-1])
         self.assertEqual(command, ['/a path/python3', '/skill path/pickup.py',
-                                   'read', 'codex:full-session-id', '--cursor', token])
+                                   'read', 'codex:full-session-id', '--max-chars', '1400', '--cursor', token])
 
     def test_changed_source_session_or_options_fail(self):
         token = self.unpack(self.page('x' * 5000))[4]

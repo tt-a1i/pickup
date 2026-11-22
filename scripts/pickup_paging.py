@@ -123,7 +123,8 @@ def render_page(
             footer += "\nEnd of selected view."
         else:
             token = _encode(dict(state, offset=end))
-            footer += "\nNext: " + shlex.join([*prefix, operation, session_id, "--cursor", token])
+            budget = ["--max-chars", str(max_chars)] if max_chars != DEFAULT_MAX_CHARS else []
+            footer += "\nNext: " + shlex.join([*prefix, operation, session_id, *budget, "--cursor", token])
         return (f"# Pickup page: characters {start}:{end}/{len(content)}\n\n"
                 + content[start:end] + "\n\n---\n" + footer)
 

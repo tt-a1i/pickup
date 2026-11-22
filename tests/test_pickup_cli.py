@@ -197,6 +197,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(tool_match.returncode, 0, tool_match.stderr)
         self.assertIn('Earliest output: ' + phrase, tool_match.stdout)
 
+    def test_later_unmarked_repost_ranks_below_earlier_assistant_passage(self):
+        clue = '布局复核'
+        original = (clue + '继续核对生成回执与工作区里的实际记录，并在恢复时确认原始会话、测试结果和最后一轮讨论。'
+                    '发布前保留输入参数、对照样例和可复查的结果。')
+        copied = original.replace('并在恢复时', '并在\n 恢复时')
+        fixtures = [
+            ('prior-user', '2025-02-01T09:00:00Z', 4, original, ''),
+            ('copied', '2025-02-01T09:10:00Z', 3, copied, ''),
+            ('original', '2025-02-01T09:05:00Z', 2, 'please verify the layout', original),
+            ('user', '2025-02-01T09:12:00Z', 1, '你之前在哪一轮做过布局复核？', ''),
+        ]
+        for name, timestamp, modified, user, reply in fixtures:
+            path = self.path.with_name(name + '.jsonl')
+            rows = [self.message('user', user) | {'timestamp': timestamp}]
+            if reply:
+                rows.append(self.message('assistant', reply) | {'timestamp': timestamp})
+            self.write(rows, sid=name, path=path)
+            os.utime(path, (modified, modified))
+        result = self.run_cli('--agent', 'codex', clue)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ids = re.findall(r'^\d+\. `codex:([^`]+)`', result.stdout, re.MULTILINE)
+        self.assertEqual(ids, ['ior-user', 'original', 'user', 'copied'])
+        self.assertEqual(result.stdout.count('probable repost'), 1)
+        self.assertIn('earlier match: codex:original', result.stdout)
+
+    def test_codex_and_antigravity_subagents_are_openable_and_opt_in_for_keyword_search(self):
+        codex_id = '12345678-1234-1234-1234-123456789abc'
+        antigravity_id = '98765432-9876-9876-9876-987654321abc'
+        marker = 'child-only marker'
+        header = {'type': 'session_meta', 'payload': {'id': codex_id, 'source': {'subagent': 'review'}}}
+        self.path.write_text('\n'.join(json.dumps(row) for row in (header, self.message('user', marker))))
+        root = self.home / '.gemini/antigravity'
+        transcript = root / 'brain' / antigravity_id / '.system_generated/logs/transcript_full.jsonl'
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({'type': 'USER_INPUT', 'content': marker}))
+        with closing(sqlite3.connect(root / 'conversation_summaries.db')) as db, db:
+            db.execute('CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, '
+                       'workspace_uris TEXT, status TEXT, parent_conversation_id TEXT)')
+            db.execute("INSERT INTO conversation_summaries VALUES (?, 'child', '', '', 'parent')", (antigravity_id,))
+
+        default = self.run_cli(marker)
+        self.assertEqual(default.returncode, 1, default.stdout)
+        expanded = self.run_cli('--include-subagents', marker)
+        self.assertEqual(expanded.returncode, 0, expanded.stderr)
+        self.assertEqual(expanded.stdout.count('| subagent |'), 2)
+        for agent, sid, link in [('codex', codex_id, f'codex://threads/{codex_id}'),
+                                 ('antigravity', antigravity_id, f'conversation://{antigravity_id}')]:
+            with self.subTest(agent=agent):
+                exact = self.run_cli(sid)
+                self.assertEqual(exact.returncode, 0, exact.stderr)
+                self.assertIn('| subagent |', exact.stdout)
+                show = self.run_cli('show', link)
+                self.assertEqual(show.returncode, 0, show.stderr)
+                self.assertIn('kind: subagent session', show.stdout)
+                read = self.run_cli('read', f'{agent}:{sid}')
+                self.assertEqual(read.returncode, 0, read.stderr)
+                self.assertIn(marker, read.stdout)
+                self.assertIn('complete=yes', read.stdout)
+
     def test_antigravity_catalog_only_match_has_an_explicit_read_boundary(self):
         root = self.home / '.gemini/antigravity'
         root.mkdir(parents=True)

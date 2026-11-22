@@ -1,9 +1,12 @@
 """Exercise the public CLI in isolated homes; never read personal histories."""
+from contextlib import closing
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,10 +31,11 @@ class CliTests(unittest.TestCase):
         return {'type': 'response_item', 'payload': {'type': 'message', 'role': role,
                 'content': [{'type': 'input_text' if role == 'user' else 'output_text', 'text': text}]}}
 
-    def write(self, rows):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        rows = [{'type': 'session_meta', 'payload': {'id': self.sid, 'cwd': '/fixture'}}] + rows
-        self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=True) for row in rows))
+    def write(self, rows, *, sid=None, path=None, cwd='/fixture'):
+        path = path or self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{'type': 'session_meta', 'payload': {'id': sid or self.sid, 'cwd': cwd}}] + rows
+        path.write_text('\n'.join(json.dumps(row, ensure_ascii=True) for row in rows))
 
     def run_cli(self, *args):
         return subprocess.run([sys.executable, str(SCRIPTS / 'pickup.py'), *args], env=self.env,
@@ -158,6 +162,101 @@ class CliTests(unittest.TestCase):
         self.assertEqual(recent.returncode, 0)
         self.assertIn('coverage: partial', recent.stderr)
         self.assertIn('unscanned=1', recent.stderr)
+
+    def test_lookup_repetition_ranks_below_original_dialogue(self):
+        phrase = 'ci-run-4512'
+        tool_outputs = [{'type': 'response_item', 'payload': {'type': 'function_call_output', 'output': text}}
+                        for text in [f'Earliest output: {phrase}', *['other output'] * 6]]
+        fixtures = [
+            ('tool', 4, [self.message('user', 'check files'), *tool_outputs]),
+            ('lookup', 3, [self.message('user', '[$pickup](/skill/SKILL.md) output from ' + phrase),
+                           self.message('assistant', 'Found the source of ' + phrase),
+                           self.message('user', 'please keep going'),
+                           self.message('user', '<send_user_message_question_reply> details </send_user_message_question_reply>'),
+                           self.message('assistant', 'Results from ' + phrase)]),
+            ('original', 2, [self.message('user', 'run CI'),
+                             self.message('assistant', 'output from ' + phrase)]),
+            ('user', 1, [self.message('user', 'Tickets about ' + phrase)]),
+        ]
+        for name, modified, rows in fixtures:
+            path = self.path.with_name(name + '.jsonl')
+            self.write(rows, sid=name, path=path)
+            os.utime(path, (modified, modified))
+        result = self.run_cli('--agent', 'codex', phrase)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidates = re.findall(r'^\d+\. `codex:([^`]+)`', result.stdout, re.MULTILINE)
+        self.assertEqual(candidates, ['original', 'user', 'lookup', 'tool'])
+        self.assertIn('match: assistant, Turn 1', result.stdout)
+        self.assertIn('match: pickup request, Turn 1', result.stdout)
+        match = self.run_cli('read', 'codex:original', '--turns', '1')
+        self.assertIn('open match: pickup read codex:original --turns 1', result.stdout)
+        self.assertEqual(match.returncode, 0, match.stderr)
+        self.assertIn('output from ' + phrase, match.stdout)
+        self.assertIn('open match: pickup read codex:tool --grep ' + phrase, result.stdout)
+        tool_match = self.run_cli('read', 'codex:tool', '--grep', phrase)
+        self.assertEqual(tool_match.returncode, 0, tool_match.stderr)
+        self.assertIn('Earliest output: ' + phrase, tool_match.stdout)
+
+    def test_antigravity_catalog_only_match_has_an_explicit_read_boundary(self):
+        root = self.home / '.gemini/antigravity'
+        root.mkdir(parents=True)
+        with closing(sqlite3.connect(root / 'conversation_summaries.db')) as db, db:
+            db.execute('CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, '
+                       'workspace_uris TEXT, status TEXT, parent_conversation_id TEXT, last_modified_time TEXT)')
+            db.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?, '', '', ?)",
+                       ('catalog-only', 'Bug from an old session', 'file:///fixture', '2025-02-03T10:11:12Z'))
+        found = self.run_cli('--agent', 'antigravity', 'Bug from an old session')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn('metadata only | transcript unavailable', found.stdout)
+        self.assertIn('coverage: partial', found.stderr)
+        self.assertIn('metadata_only=1', found.stderr)
+        self.assertIn('readable=0', found.stderr)
+        show = self.run_cli('show', 'antigravity:catalog-only')
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn('the local transcript is unavailable', show.stdout)
+        destination = self.home / 'output'
+        for args in [('read', 'antigravity:catalog-only'),
+                     ('export', 'antigravity:catalog-only', '--format', 'raw', '-o', str(destination))]:
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('the local transcript is missing', result.stderr)
+        self.assertFalse(destination.exists())
+
+    def test_search_filters_use_workspace_record_date_and_recorded_models(self):
+        fixtures = [
+            ('found', '2025-02-03', '/fixture/archify', ['gpt-astra', 'gpt-terra']),
+            ('outside', '2025-02-03', '/fixture/hive', ['gpt-astra']),
+            ('old', '2025-02-01', '/fixture/archify', ['gpt-astra']),
+            ('other', '2025-02-03', '/fixture/archify', ['gpt-terra']),
+        ]
+        for name, date, cwd, models in fixtures:
+            path = self.path.with_name(name + '.jsonl')
+            rows = [{'type': 'turn_context', 'payload': {'model': model}} for model in models]
+            self.write(rows + [self.message('user', 'test report')], sid=name, path=path, cwd=cwd)
+            modified = datetime.fromisoformat(date).timestamp()
+            os.utime(path, (modified, modified))
+        result = self.run_cli('--agent', 'codex', '--project', 'ARCHIFY', '--since', '2025-02-03',
+                              '--model', 'astra', 'test report')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('codex:found', result.stdout)
+        self.assertIn('models=gpt-astra, gpt-terra', result.stdout)
+        for name in ('outside', 'old', 'other'):
+            self.assertNotIn('codex:' + name, result.stdout)
+        self.assertIn('excluded=2, attempted=2', result.stderr)
+
+    def test_claude_jsonl_preserves_unicode_separators_in_user_text(self):
+        path = self.home / '.claude/projects/fixture/unicode.jsonl'
+        path.parent.mkdir(parents=True)
+        user_text = 'first paragraph\u2028second paragraph\u2029needle'
+        record = {'type': 'user', 'cwd': '/fixture', 'message': {'content': user_text}}
+        path.write_text(json.dumps(record, ensure_ascii=False) + '\n', encoding='utf-8')
+        result = self.run_cli('--agent', 'claude', 'needle')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('coverage: complete', result.stderr)
+        self.assertIn('match: user, Turn 1', result.stdout)
+        read = self.run_cli('read', 'claude:unicode', '--turns', '1')
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertIn(user_text, read.stdout)
 
     def test_standalone_skill_injection_not_searchable_but_real_request_survives(self):
         injection = '<skill>\n<name>fixture</name><path>/fixture</path>phantomword\n</skill>'

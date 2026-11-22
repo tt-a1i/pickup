@@ -12,7 +12,7 @@ class ScanReport:
         self.clock = clock if clock is not None else time.monotonic
         self.stats = {
             agent: {'available': None, 'discovered': 0, 'excluded': 0,
-                    'attempted': 0, 'readable': 0, 'failed': 0,
+                    'attempted': 0, 'readable': 0, 'metadata_only': 0, 'failed': 0,
                     'discovery_failed': 0, 'warnings': 0}
             for agent in agents
         }
@@ -47,6 +47,9 @@ class ScanReport:
     def readable(self, agent):
         self.stats[agent]['readable'] += 1
 
+    def metadata_only(self, agent):
+        self.stats[agent]['metadata_only'] += 1
+
     def failed(self, agent, uid, reason):
         self.stats[agent]['failed'] += 1
         self._write(f'Scan failed [{agent} {self._line(uid)}]: {self._line(reason)}')
@@ -60,12 +63,13 @@ class ScanReport:
         self._write(f'Scan warning [{agent}]: {self._line(reason)}')
 
     def finish(self):
-        totals = dict.fromkeys(('discovered', 'excluded', 'attempted', 'readable', 'failed', 'unscanned', 'discovery_failed'), 0)
+        totals = dict.fromkeys(('discovered', 'excluded', 'attempted', 'readable', 'metadata_only',
+                                'failed', 'unscanned', 'discovery_failed'), 0)
         for stats in self.stats.values():
             stats['unscanned'] = max(0, stats['discovered'] - stats['excluded'] - stats['attempted'])
             for key in totals:
                 totals[key] += stats[key]
-        partial = bool(totals['failed'] or totals['discovery_failed'] or totals['unscanned']
+        partial = bool(totals['failed'] or totals['discovery_failed'] or totals['metadata_only'] or totals['unscanned']
                        or any(stats['warnings'] for stats in self.stats.values()))
         status = 'partial' if partial else 'complete'
         self._write(f'Scan coverage: {status}; ' + ', '.join(f'{key}={value}' for key, value in totals.items()))

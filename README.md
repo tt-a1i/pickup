@@ -89,7 +89,7 @@ mkdir -p ~/.gemini/config/skills
 test ! -e ~/.gemini/config/skills/pickup && test ! -L ~/.gemini/config/skills/pickup && ln -s "$PWD" ~/.gemini/config/skills/pickup
 ```
 
-每个客户端单独安装；其他客户端请参照其技能目录说明。新开会话后输入 `/pickup`，确认客户端识别该技能并列出候选；若未识别，检查目标路径是否指向包含 `SKILL.md` 和 `scripts/` 的仓库。
+每个客户端单独安装。新开会话后，在 Codex App 输入 `$pickup` 并从候选里选中技能，在 Claude Code 或 Antigravity 可输入 `/pickup`。如果技能未出现，检查目标路径是否指向包含 `SKILL.md` 和 `scripts/` 的仓库。
 
 ---
 
@@ -109,6 +109,7 @@ python3 scripts/pickup.py "某个有辨识度的原话片段"
 # 已知来源工具时缩小扫描范围
 python3 scripts/pickup.py --agent kimi
 python3 scripts/pickup.py --agent devin "登录问题"
+python3 scripts/pickup.py --project archify --since 2026-11-01 --model astra "CI 提速"
 
 # 自定义返回数量，或显式排除当前会话
 python3 scripts/pickup.py --limit 10
@@ -118,7 +119,9 @@ python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 - **只列候选，不盲目加载**：无线索时按文件修改时间排序；有线索时对解析后的标题、摘要、对话与保留的工具记录做文字匹配排序。
 - 若运行环境提供受支持的当前会话 ID，脚本会自动排除自身；缺少时可用 `--exclude`。
 - 关键词命中会显示来源角色、轮次和文本片段，帮助判断候选是否符合线索。`--agent` 在发现阶段就限制来源。
-- 进度和详细的 `Scan coverage` 输出到 stderr。`partial` 可能表示读取失败，也可能是最近会话列表达到数量限制后正常提前停止；查看 `failed`、`discovery_failed` 和 `unscanned`，不要把未扫描的记录当成无匹配。
+- `--project` 匹配工作区路径，`--since` 匹配本地日期当天或之后修改的记录。对已有工作区路径的会话，这两个筛选可以在读取正文前缩小范围。`--model` 匹配 Codex、Antigravity、Claude Code 和 Qoder 正文里记录的模型名，包含曾切换模型的会话。
+- 标题、工作区名和对话中的原句优先。通过 pickup 提交的线索仍可匹配，排在普通对话的原句之后。候选里的 `open match` 命令可直接打开命中的轮次。
+- `Scan coverage` 的 `partial` 表示存在扫描范围缺口。查看 `failed`、`discovery_failed`、`metadata_only`、`unscanned` 和解析告警。Antigravity 只有元数据时，可用 `show` 查看标题和工作区。读取和导出需要本机有对应的正文记录。
 
 ### 第二步：查看概览与大纲（`show`）
 
@@ -166,8 +169,8 @@ Markdown 导出包含完整的解码对话和工具摘要，可加 `--with-tools
 
 装好 Skill 后，切到任意新窗口直接说：
 
-- **`/pickup`** — 先列出全机最近会话供你点选。
-- **`/pickup 帮我看下之前聊的登录超时方案`** — 按话题跨工具搜出对应会话并汇总给你。
+- **`$pickup`**（Codex App）或 **`/pickup`**（Claude Code、Antigravity）可以列出最近的会话候选。
+- 在技能名后加线索，例如「读取之前讨论登录超时的那段对话」，可以定位并总结匹配的会话。
 - **贴一段原话或一张旧窗口截图 + `接着干`** — 接手的 Agent 自动从文字或图片提取线索定位原会话，核对磁盘上的真实代码与 Git 状态后继续完成任务。
 
 ---

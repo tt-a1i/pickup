@@ -1,16 +1,19 @@
 """Exercise the public CLI in isolated homes; never read personal histories."""
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime
+import io
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
@@ -22,7 +25,7 @@ class CliTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.env = {**os.environ, 'HOME': str(self.home)}
+        self.env = {**os.environ, 'HOME': str(self.home), 'PYTHONDONTWRITEBYTECODE': '1'}
         self.sid = 'fixture-session-id'
         self.path = self.home / '.codex/sessions/fixture.jsonl'
         self.path.parent.mkdir(parents=True)
@@ -38,7 +41,10 @@ class CliTests(unittest.TestCase):
         path.write_text('\n'.join(json.dumps(row, ensure_ascii=True) for row in rows))
 
     def run_cli(self, *args):
-        return subprocess.run([sys.executable, str(SCRIPTS / 'pickup.py'), *args], env=self.env,
+        return self.run_command([sys.executable, '-B', str(SCRIPTS / 'pickup.py'), *args])
+
+    def run_command(self, command):
+        return subprocess.run(command, env=self.env,
                               text=True, capture_output=True, timeout=15)
 
     def cursor(self, stdout):
@@ -86,6 +92,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(changed.stdout, '')
         self.assertIn('Session changed', changed.stderr)
 
+    def test_restart_command_restores_the_read_view(self):
+        self.write([self.message('user', 'request'), self.message('assistant', '很长\n' * 5000)])
+        first = self.run_cli('read', self.sid, '--turns', '1', '--with-tools', '--max-bytes', '1500')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        next_command = shlex.split(first.stdout.splitlines()[-1].removeprefix('Next: '))
+        self.write([self.message('user', 'request'), self.message('assistant', '较长\n' * 5000)])
+        stale = self.run_command(next_command)
+        self.assertEqual(stale.returncode, 2)
+        self.assertEqual(stale.stdout, '')
+        restart = shlex.split(re.search(r'^Restart with: (.+)$', stale.stderr, re.MULTILINE)[1])
+        self.assertEqual(restart[2:], ['read', 'codex:' + self.sid, '--turns', '1', '--with-tools', '--max-bytes', '1500'])
+        retried = self.run_command(restart)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn('较长', retried.stdout)
+        self.assertLessEqual(len(retried.stdout.encode('utf-8')), 1500)
+
+    def test_nonpositive_view_flags_are_argument_errors(self):
+        for operation, flag, value in [('show', '--tail', '0'), ('show', '--tail', '-2'),
+                                       ('read', '--max-chars', '-2'), ('read', '--max-bytes', '-2'),
+                                       ('read', '--max-bytes', '0')]:
+            with self.subTest(flag=flag, value=value):
+                result = self.run_cli(operation, self.sid, flag, value)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, '')
+                self.assertIn(flag, result.stderr)
+
+    def test_paged_stdout_uses_utf8_even_with_a_different_locale_encoding(self):
+        self.write([self.message('user', '本地会话')])
+        self.env['PYTHONIOENCODING'] = 'latin-1'
+        result = self.run_cli('read', self.sid)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('本地会话', result.stdout)
+
     def test_overview_and_many_grep_hits_are_bounded(self):
         self.write([self.message(role, text) for _ in range(150)
                     for role, text in [('user', 'needle ' + 'x' * 200), ('assistant', 'needle ' + 'y' * 200)]])
@@ -122,6 +161,21 @@ class CliTests(unittest.TestCase):
         view = self.run_cli('read', self.sid)
         self.assertEqual(view.returncode, 0, view.stderr)
         self.assertIn('Source decoding: partial', view.stdout)
+
+    def test_raw_prefilter_skip_qualifies_json_coverage(self):
+        self.write([self.message('user', 'needle')])
+        with self.path.open('a') as stream:
+            stream.write('\n{"type":}\n')
+        missing = self.run_cli('--agent', 'codex', 'strawberry')
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        self.assertIn('prefiltered=1', missing.stderr)
+        self.assertIn('readable=0', missing.stderr)
+        for output in (missing.stdout, missing.stderr):
+            self.assertIn('coverage: complete (raw prefilter skipped JSON validation for some files)', output)
+        found = self.run_cli('--agent', 'codex', 'needle')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn('Decode warning', found.stderr)
+        self.assertIn('coverage: partial', found.stdout)
 
     def test_antigravity_metadata_failure_is_partial(self):
         root = self.home / '.gemini/antigravity'
@@ -432,6 +486,327 @@ class CliTests(unittest.TestCase):
         bad = self.run_cli('read', self.sid, '--cursor', 'not-json')
         self.assertNotEqual(bad.returncode, 0)
         self.assertEqual(bad.stdout, '')
+
+    def test_codex_prefilter_keeps_escaped_text_and_words_across_tool_fields(self):
+        stamp = '2025-04-01T09:00:00Z'
+        rows = [dict(type='session_meta', payload={'id': self.sid}), self.message('user', 'request'),
+                self.message('assistant', '一些本地会话和 "QUOTED"\npath\\name')]
+        rows.extend(dict(type='response_item', payload={'type': 'function_call_output', 'output': text})
+                    for text in ('violet', 'raspberry', [{'nested': 'nonprinting \u00adhello'}]))
+        self.path.write_text('\n'.join(json.dumps({'timestamp': stamp, **row}, separators=(',', ':')) for row in rows))
+        for query, evidence in [('本地会话', 'assistant, Turn 1'), ('"quoted"\npath\\name', 'assistant, Turn 1'),
+                                ('violet raspberry', 'words matched across fields'),
+                                ('xadhello', 'tool output, Turn 1')]:
+            with self.subTest(query=query):
+                result = self.run_cli('--agent', 'codex', query)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(evidence, result.stdout)
+        missing = self.run_cli('--agent', 'codex', 'strawberry')
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        # The Unicode-escaped file defers to the decoder. A literal-only file
+        # can be ruled out without parsing it.
+        self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in rows[:2]))
+        missing = self.run_cli('--agent', 'codex', 'strawberry')
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        self.assertIn('prefiltered=1', missing.stderr)
+
+    def test_explicit_source_citation_and_directory_listing_rank_below_reply(self):
+        for sid, rows, stamp in [
+            ('original', [self.message('user', 'check the run'), self.message('assistant', 'CI run 44968716810')], 1),
+            ('citation', [self.message('user', 'Verify that codex:original still ranks first for 44968716810')], 2),
+            ('listing', [self.message('user', 'list the output directory'),
+                         dict(type='response_item', payload=dict(type='function_call_output', output='report-44968716810.md'))], 3),
+        ]:
+            path = self.path.with_name(sid + '.jsonl')
+            self.write([{'timestamp': f'2025-04-0{stamp}T09:00:00Z', **row} for row in rows], path=path, sid=sid)
+            os.utime(path, (stamp, stamp))
+        result = self.run_cli('44968716810')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(re.findall(r'^\d+\. \x60codex:([^\x60]+)', result.stdout, re.MULTILINE),
+                         ['original', 'citation', 'listing'])
+        self.assertIn('citing an earlier match', result.stdout)
+
+    def write_antigravity_index(self, session_ids, chunks):
+        root = self.home / '.gemini/antigravity'
+        root.mkdir(parents=True)
+        db_path = root / 'conversation_summaries.db'
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute('CREATE TABLE conversation_summaries '
+                       '(conversation_id, title, workspace_uris, status, parent_conversation_id)')
+            db.executemany("INSERT INTO conversation_summaries VALUES (?, 'indexed fixture', '', '', '')",
+                           [(sid,) for sid in session_ids])
+            columns = ('chunk_index, chunk_first_step, user_step_byte_offsets, agent_step_byte_offsets, user_body, agent_body')
+            if db.execute("SELECT sqlite_compileoption_used('ENABLE_FTS5')").fetchone()[0]:
+                db.execute(f'CREATE VIRTUAL TABLE conversations_fts USING fts5(conversation_id UNINDEXED, {columns})')
+            else:
+                db.execute(f'CREATE TABLE conversations_fts (conversation_id, {columns})')
+            db.executemany('INSERT INTO conversations_fts VALUES (?, ?, ?, ?, ?, ?, ?)', chunks)
+        return db_path
+
+    def test_antigravity_fts_fallback_preserves_order_and_labels_fidelity(self):
+        sid = 'indexed-antigravity'
+        db_path = self.write_antigravity_index([sid], [
+            (sid, 0, 1, b'[[1,0],[3,7]]', b'[[2,0],[4,13]]', '一问\n二问', '独特回答\n后续'),
+        ])
+        view = self.run_cli('read', 'antigravity:' + sid, '--all')
+        self.assertEqual(view.returncode, 0, view.stderr)
+        self.assertIn('SQLite indexed text', view.stdout)
+        self.assertLess(view.stdout.index('独特回答'), view.stdout.index('二问'))
+        self.assertIn('后续', view.stdout)
+        show = self.run_cli('show', 'antigravity:' + sid)
+        self.assertIn('fidelity:', show.stdout)
+        search = self.run_cli('--agent', 'antigravity', '独特回答')
+        self.assertEqual(search.returncode, 0, search.stderr)
+        self.assertIn('assistant, Turn 1', search.stdout)
+        self.assertIn('indexed_text=1', search.stderr)
+        destination = self.home / 'indexed.md'
+        export = self.run_cli('export', 'antigravity:' + sid, '--output', str(destination))
+        self.assertEqual(export.returncode, 0, export.stderr)
+        self.assertIn('conversations_fts', destination.read_text())
+        raw = self.run_cli('export', 'antigravity:' + sid, '--format', 'raw', '--output', str(self.home / 'raw'))
+        self.assertEqual(raw.returncode, 2)
+        self.assertIn('Use the Markdown export', raw.stderr)
+        with closing(pickup.pickup_extra.open_readonly_db(db_path)) as db:
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'readonly'):
+                db.execute('DELETE FROM conversation_summaries')
+
+    def test_antigravity_keyword_search_reads_the_index_in_one_pass(self):
+        ids = ['indexed-one', 'indexed-two', 'with-transcript']
+        db_path = self.write_antigravity_index(ids, [
+            (sid, 0, 1, '[[1,0]]', '[[2,0]]', 'question', f'needle in {sid}') for sid in ids
+        ])
+        raw = self.home / '.gemini/antigravity/brain/with-transcript/.system_generated/logs/transcript_full.jsonl'
+        raw.parent.mkdir(parents=True)
+        raw.write_text(json.dumps({'type': 'USER_INPUT', 'content': 'different raw transcript'}))
+        statements = []
+        open_db = pickup.pickup_extra.open_readonly_db
+
+        def traced_open(path):
+            db = open_db(path)
+            db.set_trace_callback(statements.append)
+            return db
+
+        output = io.StringIO()
+        with patch.object(pickup, 'HOME', self.home), patch.object(pickup.pickup_extra, 'open_readonly_db', traced_open), \
+                patch.object(sys, 'argv', ['pickup', '--agent', 'antigravity', 'needle']), \
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            self.assertEqual(pickup.main(), 0)
+        self.assertIn('needle in indexed-one', output.getvalue())
+        self.assertIn('needle in indexed-two', output.getvalue())
+        self.assertNotIn('needle in with-transcript', output.getvalue())
+        index_reads = [sql for sql in statements if re.search(r'\bFROM conversations_fts\b', sql, re.IGNORECASE)]
+        with closing(open_db(db_path)) as db:
+            plans = [detail for sql in index_reads for *_, detail in db.execute('EXPLAIN QUERY PLAN ' + sql)]
+        full_scans = [plan for plan in plans if re.fullmatch(r'SCAN conversations_fts(?: VIRTUAL TABLE INDEX \d+:)?', plan)]
+        self.assertLessEqual(len(full_scans), 1, plans)
+
+    def test_codex_sqlite_orphan_and_rollout_priority(self):
+        sid = 'sqlite-only-session'
+        state = self.home / '.codex/state_5.sqlite'
+        with closing(sqlite3.connect(state)) as db, db:
+            db.execute('CREATE TABLE threads (id, rollout_path, cwd, title, source, updated_at, model)')
+            db.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)',
+                       (sid, str(self.path.with_name('missing.jsonl')), '/fixture', 'sqlite fixture', 'exec', 10, 'fixture-model'))
+        history = self.home / '.codex/thread_history_1.sqlite'
+        with closing(sqlite3.connect(history)) as db, db:
+            db.execute('CREATE TABLE thread_items (thread_id, item_type, item_json, created_at_ms, rollout_ordinal, item_id)')
+            for thread in (sid, self.sid):
+                for ordinal, (item_type, item) in enumerate([
+                    ('userMessage', {'content': [{'type': 'text', 'text': 'projected prompt'}]}),
+                    ('agentMessage', {'text': 'unique projected reply'}),
+                    ('reasoning', {'text': 'hidden reasoning'}),
+                ]):
+                    db.execute('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?)',
+                               (thread, item_type, json.dumps(item), 1_750_000_000_000, ordinal, str(ordinal)))
+        self.write([self.message('user', 'preferred rollout')])
+        show = self.run_cli('show', 'codex:' + sid)
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn('SQLite projected dialogue', show.stdout)
+        read = self.run_cli('read', 'codex:' + sid, '--turns', '1')
+        self.assertIn('unique projected reply', read.stdout)
+        self.assertNotIn('hidden reasoning', read.stdout)
+        self.assertIn('preferred rollout', self.run_cli('read', self.sid).stdout)
+        search = self.run_cli('--agent', 'codex', '--model', 'fixture-model', 'unique projected reply')
+        self.assertEqual(search.returncode, 0, search.stderr)
+        self.assertIn('sqlite_history=1', search.stderr)
+        self.assertIn('assistant, Turn 1', search.stdout)
+        destination = self.home / 'sqlite.md'
+        export = self.run_cli('export', 'codex:' + sid, '--output', str(destination))
+        self.assertEqual(export.returncode, 0, export.stderr)
+        self.assertIn('thread_items', destination.read_text())
+        raw = self.run_cli('export', 'codex:' + sid, '--format', 'raw', '--output', str(self.home / 'raw'))
+        self.assertEqual(raw.returncode, 2)
+        self.assertIn('lacks raw events', raw.stderr)
+
+    def test_codex_sqlite_image_only_prompts_keep_their_own_replies(self):
+        sid = 'images-only-fixture'
+        history = self.home / '.codex/thread_history_1.sqlite'
+        messages = [
+            ('userMessage', {'content': [{'type': 'text', 'text': 'original text question'}]}),
+            ('agentMessage', {'text': 'original text answer'}),
+            ('userMessage', {'content': [{'type': 'localImage', 'path': '/fixture/photo.png'}]}),
+            ('agentMessage', {'text': 'local image answer'}),
+            ('userMessage', {'content': [{'type': 'image', 'url': 'data:image/png;base64,private-bytes'}]}),
+            ('agentMessage', {'text': 'remote image answer'}),
+        ]
+        with closing(sqlite3.connect(history)) as db, db:
+            db.execute('CREATE TABLE thread_items (thread_id, item_type, item_json, created_at_ms, rollout_ordinal, item_id)')
+            db.executemany('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?)', [
+                (sid, kind, json.dumps(item), 1_750_000_000_000, index, str(index))
+                for index, (kind, item) in enumerate(messages)
+            ])
+        for turn, image, reply in [('2', '[Image attachment: /fixture/photo.png]', 'local image answer'),
+                                   ('3', '[Image attachment]', 'remote image answer')]:
+            with self.subTest(turn=turn):
+                result = self.run_cli('read', 'codex:' + sid, '--turns', turn)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(image, result.stdout)
+                self.assertIn(reply, result.stdout)
+                self.assertNotIn('original text answer', result.stdout)
+                self.assertNotIn('private-bytes', result.stdout)
+
+    def test_nested_subagents_open_directly_and_opt_in_for_search_and_list(self):
+        sid = 'agent-ageneral-purpose-fixture'
+        for agent in ('qoder', 'claude'):
+            with self.subTest(agent=agent):
+                path = self.home / f'.{agent}/projects/project/parent/subagents/{sid}.jsonl'
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({'type': 'user', 'message': {'content': 'subagent unique marker'}}))
+                uid = agent + ':' + sid
+                self.assertIn('kind: subagent session', self.run_cli('show', uid).stdout)
+                self.assertIn('subagent unique marker', self.run_cli('read', uid).stdout)
+                exported = self.home / f'{agent}.md'
+                self.assertEqual(self.run_cli('export', uid, '--output', str(exported)).returncode, 0)
+                self.assertIn('subagent unique marker', exported.read_text())
+                self.assertNotIn(uid, self.run_cli('--agent', agent).stdout)
+                self.assertNotIn(uid, self.run_cli('--agent', agent, 'subagent unique marker').stdout)
+                self.assertIn(uid, self.run_cli('--agent', agent, '--include-subagents').stdout)
+                found = self.run_cli('--agent', agent, '--include-subagents', 'subagent unique marker')
+                self.assertEqual(found.returncode, 0, found.stderr)
+                self.assertIn(uid, found.stdout)
+
+    def test_locked_sqlite_history_leaves_rollout_readable(self):
+        self.write([self.message('user', 'rollout still readable')])
+        with closing(sqlite3.connect(self.home / '.codex/thread_history_1.sqlite')) as db:
+            db.execute('BEGIN EXCLUSIVE')
+            db.execute('CREATE TABLE thread_items (thread_id)')
+            result = self.run_cli('read', 'codex:' + self.sid)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('rollout still readable', result.stdout)
+            self.assertIn('SQLite history unavailable', result.stderr)
+
+    def test_qoder_active_leaf_and_historical_turn_references(self):
+        path = self.home / '.qoder/projects/project/branch-fixture.jsonl'
+        path.parent.mkdir(parents=True)
+
+        def row(role, uuid, parent, text):
+            content = text if role == 'user' else [{'type': 'text', 'text': text}]
+            return dict(type=role, uuid=uuid, parentUuid=parent, message={'content': content})
+
+        rows = [row('user', 'u', None, 'original question'),
+                row('assistant', 'old', 'u', 'historical answer'),
+                row('assistant', 'new', 'u', 'active answer'),
+                {'type': 'active-leaf', 'leafUuid': 'new'},
+                row('user', 'abandoned', 'old', 'historical followup'),
+                row('assistant', 'last', 'abandoned', 'another abandoned answer')]
+        del rows[0]['parentUuid']  # Roots can omit the link.
+        path.write_text('\n'.join(json.dumps(record) for record in rows))
+        uid = 'qoder:branch-fixture'
+        for operation in ('read', 'show'):
+            active = self.run_cli(operation, uid)
+            self.assertEqual(active.returncode, 0, active.stderr)
+            self.assertIn('active answer', active.stdout)
+            self.assertNotIn('historical answer', active.stdout)
+            self.assertNotIn('historical followup', active.stdout)
+        history = self.run_cli('read', uid, '--grep', 'historical answer')
+        self.assertIn('Turn 1', history.stdout)
+        self.assertIn('[off-branch]', history.stdout)
+        found = self.run_cli('historical answer')
+        self.assertIn('assistant, Turn 1 (off-branch)', found.stdout)
+        command = re.search(r'open match: pickup (.+)', found.stdout)
+        self.assertIsNotNone(command, found.stdout)
+        opened = self.run_cli(*shlex.split(command[1]))
+        self.assertIn('historical answer', opened.stdout)
+        self.assertIn('active answer', opened.stdout)
+        self.assertNotIn('historical followup', opened.stdout)
+        self.assertIn('historical followup', self.run_cli('read', uid, '--all-branches', '--turns', '2').stdout)
+
+    def write_qoder_graph(self, sid, rows):
+        path = self.home / '.qoder/projects/project' / (sid + '.jsonl')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(map(json.dumps, rows)))
+        return 'qoder:' + sid
+
+    @staticmethod
+    def qoder_row(role, uuid, parent, content):
+        if isinstance(content, str):
+            content = [{'type': 'text', 'text': content}]
+        return dict(type=role, uuid=uuid, parentUuid=parent, message={'content': content})
+
+    def test_qoder_active_history_crosses_compact_boundaries(self):
+        row = self.qoder_row
+        uid = self.write_qoder_graph('compacted', [
+            row('user', 'u', None, 'original prompt before compaction'),
+            row('assistant', 'a', 'u', 'original answer before compaction'),
+            row('assistant', 'old', 'u', 'abandoned answer before compaction'),
+            {'type': 'system', 'subtype': 'compact_boundary', 'uuid': 'compact', 'logicalParentUuid': 'a'},
+            row('user', 'next', 'compact', 'prompt after compaction'),
+            row('assistant', 'end', 'next', 'answer after compaction'),
+            {'type': 'active-leaf', 'leafUuid': 'end'},
+        ])
+        destination = self.home / 'compacted.md'
+        outputs = []
+        for args in [('show', uid), ('read', uid, '--all'), ('export', uid, '-o', str(destination))]:
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(destination.read_text() if args[0] == 'export' else result.stdout)
+        for output in outputs:
+            self.assertIn('original prompt before compaction', output)
+            self.assertIn('original answer before compaction', output)
+            self.assertIn('answer after compaction', output)
+            self.assertNotIn('abandoned answer before compaction', output)
+        hit = self.run_cli('read', uid, '--grep', 'original answer before compaction')
+        self.assertIn('Turn 1', hit.stdout)
+        self.assertNotIn('[off-branch]', hit.stdout)
+
+    def test_qoder_parallel_tool_results_stay_with_the_active_turn(self):
+        row = self.qoder_row
+
+        def call(uuid, parent):
+            return row('assistant', uuid, parent, [{'type': 'tool_use', 'id': uuid, 'name': 'Lookup'}])
+
+        def result(uuid, parent, call_id, text):
+            return row('user', uuid, parent, [{'type': 'tool_result', 'tool_use_id': call_id, 'content': text}])
+
+        call_ids = [f'tool-{number}' for number in range(1, 7)]
+        outputs = [f'parallel marker {number}' for number in range(1, 7)]
+        calls = [call(uuid, parent) for uuid, parent in zip(call_ids, ['u', *call_ids])]
+        results = [result(f'result-{uuid}', uuid, uuid, text) for uuid, text in zip(call_ids, outputs)]
+        uid = self.write_qoder_graph('parallel', [
+            row('user', 'u', None, 'lookup question'),
+            *calls, *results,
+            row('assistant', 'end', 'result-tool-6', 'active reply'),
+            result('other', 'tool-1', 'unknown-tool', 'unrelated tool marker'),
+            row('assistant', 'old', 'tool-1', 'abandoned assistant reply'),
+            result('behind-fork', 'old', 'tool-1', 'tool marker behind an abandoned reply'),
+            row('user', 'followup', 'tool-1', 'abandoned user reply'),
+            {'type': 'active-leaf', 'leafUuid': 'end'},
+        ])
+        destination = self.home / 'parallel.md'
+        view = self.run_cli('read', uid, '--with-tools')
+        self.assertEqual(view.returncode, 0, view.stderr)
+        exported = self.run_cli('export', uid, '--with-tools', '-o', str(destination))
+        self.assertEqual(exported.returncode, 0, exported.stderr)
+        for output in [view.stdout, destination.read_text()]:
+            self.assertEqual(re.findall(r'^parallel marker \d+$', output, re.MULTILINE), outputs)
+            self.assertNotIn('unrelated tool marker', output)
+            self.assertNotIn('tool marker behind an abandoned reply', output)
+            self.assertNotIn('abandoned assistant reply', output)
+            self.assertNotIn('abandoned user reply', output)
+        hit = self.run_cli('read', uid, '--grep', 'parallel marker')
+        self.assertEqual(re.findall(r'^parallel marker \d+$', hit.stdout, re.MULTILINE), outputs)
+        self.assertEqual(hit.stdout.count('### Turn 1 '), 1)
+        self.assertNotIn('[off-branch]', hit.stdout)
 
 
 if __name__ == '__main__':

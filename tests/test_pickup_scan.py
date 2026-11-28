@@ -7,8 +7,27 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from pickup_scan import ScanReport
+from pickup_scan import QueryPrefilter, ScanReport
 import pickup_extra
+
+
+class QueryPrefilterTest(unittest.TestCase):
+    def test_case_escapes_and_blocks(self):
+        cases = [
+            ('本地会话', '本地会话', False, True),
+            ('本地会话', '本地会话', True, True),
+            ('本地会话', r'\u672c\u5730\u4f1a\u8bdd', False, False),
+            ('interrupted session', 'SESSION\nwas INTERRUPTED', False, True),
+            ('hello "world"\\path', 'hello "world"\\path', True, True),
+            ('kelvin', 'KELVIN', False, True),
+            ('ascii', 'ASCİİ', False, True),
+            ('some query', 'unrelated Cyrillic Ж', False, False),
+        ]
+        for query, text, ascii_only, expected in cases:
+            with self.subTest(query=query, text=text, ascii_only=ascii_only):
+                row = json.dumps({'text': 'x' * (256 * 1024 - 11) + text}, ensure_ascii=ascii_only)
+                stream = io.BytesIO((row + '\n{"text":"other row"}\n').encode('utf-8'))
+                self.assertEqual(QueryPrefilter(query).may_match(stream), expected)
 
 
 class ScanReportTest(unittest.TestCase):

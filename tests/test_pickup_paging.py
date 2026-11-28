@@ -59,6 +59,30 @@ class PagingTests(unittest.TestCase):
                 self.assertIn(f'view={view} complete=no', page)
                 self.assertIsNotNone(self.unpack(page)[4])
 
+    def test_default_and_custom_byte_budgets_include_footer_and_newline(self):
+        text = ('界🙂' * 3000) + '\nlast line'
+        for max_chars, max_bytes, expected in [(None, None, 8000), (None, 1250, 1250), (3000, 1800, 1800)]:
+            with self.subTest(max_chars=max_chars, max_bytes=max_bytes):
+                cursor, chunks = None, []
+                while True:
+                    page = self.page(text, max_chars=max_chars, max_bytes=max_bytes, cursor=cursor)
+                    self.assertLessEqual(len((page + '\n').encode('utf-8')), expected)
+                    start, end, _, payload, cursor = self.unpack(page)
+                    self.assertGreater(end, start)
+                    chunks.append(payload)
+                    if cursor is None:
+                        self.assertTrue(page.endswith('End of selected view.'))
+                        self.assertIn('complete=yes', page)
+                        break
+                    self.assertIn('complete=no', page)
+                    self.assertLess(len(chunks), 100)
+                    if max_bytes is not None:
+                        self.assertIn(f'--max-bytes {max_bytes} --cursor', page)
+                self.assertEqual(''.join(chunks), text)
+        char_only = self.page(text, max_chars=3000)
+        self.assertGreater(len(char_only.encode('utf-8')), 8000)
+        self.assertLessEqual(len(char_only) + 1, 3000)
+
     def test_cursor_recovers_options_and_quotes_command_arguments(self):
         options = {'grep': 'quoted "needle" 中文', 'with_tools': True, 'turns': None}
         page = self.page('x' * 5000, options=options,

@@ -36,6 +36,11 @@ class SelectionTests(unittest.TestCase):
             found = p.find_matching_sessions([own, prior], None)
         self.assertEqual([m.raw_id for m, _, _ in found], ['prior'])
 
+    def test_claude_uses_explicit_local_id_instead_of_remote_id(self):
+        with patch.dict(os.environ, {'CLAUDE_SESSION_ID': 'local-id',
+                                     'CLAUDE_CODE_BRIDGE_SESSION_ID': 'session_remote'}, clear=True):
+            self.assertEqual(p.caller_session_ids(), {'local-id'})
+
     def test_old_match_beyond_previous_search_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             files = []
@@ -92,6 +97,21 @@ class HistoryRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             meta = self.write(directory, 'codex', [self.codex_message('user', 'needle')])
             self.assertEqual(len(p.find_matching_sessions([meta], 'codex needle')), 1)
+
+    def test_matching_codex_file_skips_reasoning_and_unrelated_tool_payloads(self):
+        rows = [
+            self.codex_message('user', 'question'),
+            dict(type='response_item', payload=dict(type='reasoning', encrypted_content='needle' * 10_000)),
+            dict(type='response_item', payload=dict(type='function_call_output', output='directory entry' * 10_000)),
+            self.codex_message('assistant', 'needle in the answer'),
+        ]
+        lines = [json.dumps({'timestamp': '2025-05-01T09:00:00Z', **row},
+                            separators=(',', ':')).encode() for row in rows]
+        meta = p.SessionMeta('codex:test', 'codex', 'test', Path('/unused'), 1)
+        with patch.object(p.json, 'loads', wraps=json.loads) as decode:
+            turns, _ = p.parse_codex_records(meta, lines, search_only=True, prefilter=p.QueryPrefilter('needle'))
+        self.assertEqual(decode.call_count, 2)
+        self.assertEqual(turns[0].assistant_texts, ['needle in the answer'])
 
     def test_antigravity_search_and_read_share_full_history(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):

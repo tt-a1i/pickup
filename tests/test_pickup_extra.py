@@ -10,6 +10,12 @@ import pickup_extra as extra
 
 
 class ReadersTest(unittest.TestCase):
+    def test_antigravity_invalid_step_offsets_fall_back_to_chunk_text(self):
+        for offsets in ('{}', '{"0": [1, 0]}', '[{}]', '[[1]]', '[[1, 0], [2, 2]]',
+                        '[[true, 0]]', '["10"]', 'null'):
+            with self.subTest(offsets=offsets):
+                self.assertEqual(extra._indexed_steps(' 一问 ', offsets, 7), [(7, '一问')])
+
     def test_kimi_uses_committed_messages_not_replayed_events(self):
         with tempfile.TemporaryDirectory() as temp:
             session = Path(temp) / 'wd_project' / 'session_abc'

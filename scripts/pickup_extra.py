@@ -1,11 +1,10 @@
-"""Readers for locally stored Kimi Code and Devin CLI conversations."""
+"""SQLite session stores, Kimi Code wire logs, and Qoder branch links."""
 import datetime as dt
 import os
 from contextlib import closing
 import json
 import sqlite3
 from pathlib import Path
-from urllib.parse import quote
 
 
 def _time(value):
@@ -17,11 +16,21 @@ def _time(value):
         return ''
 
 
-def _text(content):
+def _text(content, *, image_attachments=False):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return '\n'.join(part.get('text', '') for part in content if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str)).strip()
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get('type')
+            if kind == 'text' and isinstance(part.get('text'), str):
+                parts.append(part['text'])
+            elif image_attachments and kind in ('localImage', 'image'):
+                path = part.get('path')
+                parts.append(f'[Image attachment: {path}]' if isinstance(path, str) and path else '[Image attachment]')
+        return '\n'.join(parts).strip()
     return ''
 
 
@@ -117,8 +126,205 @@ def parse_kimi(path, on_error=None):
     return turns
 
 
-def _db(path):
-    return sqlite3.connect('file:' + quote(str(Path(path).resolve())) + '?mode=ro', uri=True)
+def open_readonly_db(path):
+    return sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)
+
+
+_INDEXED_CHUNK_COLUMNS = 'chunk_first_step, user_step_byte_offsets, agent_step_byte_offsets, user_body, agent_body'
+_INDEXED_CHUNK_ORDER = 'ORDER BY chunk_index, rowid'
+
+
+def antigravity_indexed_sessions(path, session_ids, *, batch_chunks=False):
+    """Find indexed fallbacks, optionally retaining their chunks in the same FTS scan."""
+    with closing(open_readonly_db(path)) as conn:
+        table = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'conversations_fts'").fetchone()
+        if not table:
+            return {}
+        has_body = "WHERE user_body <> '' OR agent_body <> ''"
+        if not batch_chunks:
+            rows = conn.execute(f"SELECT DISTINCT conversation_id FROM conversations_fts {has_body}")
+            return {sid: None for (sid,) in rows if sid in session_ids}
+
+        # conversation_id is UNINDEXED. Read the table once for a corpus search.
+        rows = conn.execute(f'SELECT conversation_id, {_INDEXED_CHUNK_COLUMNS} FROM conversations_fts '
+                            f'{has_body} {_INDEXED_CHUNK_ORDER}')
+        chunks = {}
+        for row in rows:
+            sid = row[0]
+            if sid in session_ids:
+                chunks.setdefault(sid, []).append(row[1:])
+        return chunks
+
+
+def _indexed_steps(body, offsets, first_step):
+    if not body:
+        return []
+    raw = body.encode('utf-8')
+    try:
+        starts = json.loads(offsets)
+        if (not isinstance(starts, list) or not starts
+                or any(not isinstance(pair, list) or len(pair) != 2
+                       or any(type(value) is not int for value in pair) for pair in starts)
+                or starts[0][1] != 0):
+            raise ValueError('invalid step offsets')
+        ends = starts[1:] + [(None, len(raw))]
+        steps = []
+        for (step, start), (_, end) in zip(starts, ends):
+            if not 0 <= start <= end <= len(raw):
+                raise ValueError('invalid step offset')
+            text = raw[start:end].decode('utf-8').strip()
+            if text:
+                steps.append((step, text))
+        return steps
+    except (ValueError, TypeError):
+        # The index can retain usable text even when step boundaries are absent.
+        return [(first_step, body.strip())]
+
+
+def antigravity_indexed_messages(path, session_id, *, chunks=None):
+    if chunks is None:
+        with closing(open_readonly_db(path)) as conn:
+            chunks = conn.execute(
+                f'SELECT {_INDEXED_CHUNK_COLUMNS} FROM conversations_fts '
+                f'WHERE conversation_id = ? {_INDEXED_CHUNK_ORDER}', (session_id,),
+            ).fetchall()
+    messages = {}
+    for first, user_offsets, agent_offsets, user_body, agent_body in chunks:
+        for role, body, offsets in (('user', user_body, user_offsets), ('assistant', agent_body, agent_offsets)):
+            for step, text in _indexed_steps(body, offsets, first):
+                messages.setdefault((step, role == 'assistant', role, text), None)
+    return [(role, text, None) for _, _, role, text in sorted(messages, key=lambda entry: entry[:2])]
+
+
+def discover_codex_history(path, state_path, file_ids, *, on_error=None):
+    if not path.is_file():
+        return []
+    catalog, children = {}, set()
+    if state_path is not None:
+        try:
+            with closing(open_readonly_db(state_path)) as conn:
+                columns = {row[1] for row in conn.execute('PRAGMA table_info(threads)')}
+                fields = ('id', 'rollout_path', 'cwd', 'title', 'source', 'updated_at', 'model', 'agent_role')
+                select = ', '.join(field if field in columns else 'NULL' for field in fields)
+                catalog = {row[0]: row[1:] for row in conn.execute(f'SELECT {select} FROM threads')}
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'thread_spawn_edges'").fetchone():
+                    children = {row[0] for row in conn.execute('SELECT child_thread_id FROM thread_spawn_edges')}
+        except (OSError, sqlite3.Error):
+            if on_error:
+                on_error('codex', 'SQLite thread metadata unavailable; reading history without it')
+    with closing(open_readonly_db(path)) as conn:
+        ids = {row[0] for row in conn.execute('SELECT DISTINCT thread_id FROM thread_items')}
+        sessions = []
+        for sid in sorted(ids - file_ids):
+            rollout, cwd, title, source, updated, model, agent_role = catalog.get(sid, (None,) * 7)
+            if rollout and Path(rollout).is_file():
+                continue
+            # Look at each orphan only. Existing rollouts remain the primary source.
+            stamp = conn.execute(
+                "SELECT max(created_at_ms) FROM thread_items WHERE thread_id = ? "
+                "AND item_type IN ('userMessage', 'agentMessage')", (sid,),
+            ).fetchone()[0]
+            if stamp is None:
+                continue
+            try:
+                source_data = json.loads(source) if source else None
+            except (ValueError, TypeError):
+                source_data = None
+            sessions.append(dict(raw_id=sid, path=path, mtime=updated or stamp / 1000,
+                                 cwd=cwd or '', title=title or '', stored_model=model or '',
+                                 is_subagent=bool(sid in children or agent_role
+                                                  or isinstance(source_data, dict) and 'subagent' in source_data)))
+    return sessions
+
+
+def codex_history_messages(path, session_id, on_error):
+    with closing(open_readonly_db(path)) as conn:
+        rows = conn.execute(
+            "SELECT item_type, item_json, created_at_ms FROM thread_items WHERE thread_id = ? "
+            "AND item_type IN ('userMessage', 'agentMessage') ORDER BY rollout_ordinal, item_id", (session_id,),
+        )
+        for kind, raw, stamp in rows:
+            try:
+                item = json.loads(raw)
+                if not isinstance(item, dict):
+                    raise ValueError('expected a message object')
+                if kind == 'userMessage':
+                    yield 'user', _text(item.get('content'), image_attachments=True), stamp
+                else:
+                    yield 'assistant', _text(item.get('text')), stamp
+            except (ValueError, TypeError):
+                on_error()
+
+
+def _message_blocks(record):
+    message = record.get('message')
+    content = message.get('content') if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def qoder_branches(records, *, all_branches):
+    """Partition the graph into the active path and historical paths at their forks."""
+    nodes = {record['uuid']: record for record in records
+             if isinstance(record.get('uuid'), str) and record['uuid']}
+    if not nodes or not any('parentUuid' in record or 'logicalParentUuid' in record
+                            or record.get('type') == 'active-leaf' for record in records):
+        return None
+    inferred_leaf = next((uuid for uuid in reversed(nodes) if nodes[uuid].get('type') in ('user', 'assistant')), None)
+    if inferred_leaf is None:
+        return None
+    unlinked = [record for record in records if record.get('type') in ('user', 'assistant')
+                and (not isinstance(record.get('uuid'), str) or not record['uuid'])]
+    leaf = next((record['leafUuid'] for record in reversed(records)
+                 if record.get('type') == 'active-leaf' and 'leafUuid' in record), inferred_leaf)
+    invalid_leaf = leaf is not None and (not isinstance(leaf, str) or leaf not in nodes)
+    if invalid_leaf:
+        leaf = inferred_leaf
+    incomplete = invalid_leaf or bool(unlinked)
+    claimed = set()
+
+    def take_path(tip):
+        nonlocal incomplete
+        path = []
+        seen = set()
+        while tip in nodes and tip not in claimed and tip not in seen:
+            seen.add(tip)
+            node = nodes[tip]
+            path.append(node)
+            parent = node.get('parentUuid') or node.get('logicalParentUuid')
+            tip = parent if isinstance(parent, str) else None
+        incomplete |= tip is not None and (tip not in nodes or tip in seen)
+        claimed.update(seen)
+        return (tip if tip not in seen else None), list(reversed(path))
+
+    parent, active = take_path(leaf if isinstance(leaf, str) else None)
+    tool_ids = {block['id'] for record in active if record.get('type') == 'assistant'
+                for block in _message_blocks(record)
+                if isinstance(block, dict) and block.get('type') == 'tool_use'
+                and isinstance(block.get('id'), str) and block['id']}
+    parallel_results = set()
+    if tool_ids:
+        for uuid, record in nodes.items():
+            call = record.get('parentUuid')
+            if (uuid in claimed or record.get('type') != 'user' or record.get('isMeta')
+                    or not isinstance(call, str) or call not in claimed):
+                continue
+            blocks = _message_blocks(record)
+            if blocks and all(isinstance(block, dict) and block.get('type') == 'tool_result'
+                              and isinstance(block.get('tool_use_id'), str) and block['tool_use_id'] in tool_ids
+                              for block in blocks):
+                parallel_results.add(uuid)
+    if parallel_results:
+        # The next reply may link to just one result from a batch of parallel calls.
+        claimed.update(parallel_results)
+        active = [record for uuid, record in nodes.items() if uuid in claimed]
+    paths = [(parent, active)]
+    if all_branches:
+        for tip in reversed(nodes):
+            if tip not in claimed:
+                paths.append(take_path(tip))
+        if unlinked:
+            paths.append((None, unlinked))
+    return paths, incomplete
 
 
 def discover_devin(db=None, on_error=None):
@@ -132,7 +338,7 @@ def discover_devin(db=None, on_error=None):
             on_error('devin', 'Cannot inspect session database')
         return []
     try:
-        with closing(_db(db)) as conn:
+        with closing(open_readonly_db(db)) as conn:
             rows = conn.execute('SELECT id, working_directory, title, last_activity_at FROM sessions WHERE hidden = 0').fetchall()
         return [dict(raw_id=str(sid), path=f'{db}#{sid}', mtime=float(ts or 0), cwd=cwd or '', title=title or '') for sid, cwd, title, ts in rows]
     except (sqlite3.Error, OSError, ValueError):
@@ -145,7 +351,7 @@ def _devin_session_rows(path):
     db, sep, sid = str(path).rpartition('#')
     if not sep or not db or not sid:
         raise ValueError('Devin session path must include database path and session ID')
-    with closing(_db(db)) as conn:
+    with closing(open_readonly_db(db)) as conn:
         conn.execute('BEGIN')
         row = conn.execute('SELECT main_chain_id FROM sessions WHERE id = ?', (sid,)).fetchone()
         if row is None:

@@ -41,10 +41,10 @@ You explored an architecture in **Antigravity** and want **Codex** to implement 
 
 | Agent | Default Local Store | What `pickup` Reads |
 | :--- | :--- | :--- |
-| **Antigravity** | `~/.gemini/antigravity/brain/` | Full main-session transcript + recent background task logs |
-| **Codex** | `~/.codex/sessions/`, `~/.codex/archived_sessions/` | Main-session JSONL and `.jsonl.zst`, including user text and image references in attachment messages |
-| **Claude Code** | `~/.claude/projects/` | Project main-session JSONL (supports array-of-text-blocks tool results) |
-| **Qoder** | `~/.qoder/projects/`, `~/.qoder-cn/projects/`, `~/.qoderwork/projects/` | Project session JSONL (Global, CN, and QoderWork editions) |
+| **Antigravity** | `~/.gemini/antigravity/` | Transcripts and recent task logs, with a read-only `conversations_fts` text fallback |
+| **Codex** | `~/.codex/sessions/`, `~/.codex/archived_sessions/`, `~/.codex/thread_history_1.sqlite` | JSONL and `.jsonl.zst` rollouts, with a read-only SQLite dialogue fallback for missing rollouts |
+| **Claude Code** | `~/.claude/projects/` | Project and nested subagent JSONL, including text blocks in tool results |
+| **Qoder** | `~/.qoder/projects/`, `~/.qoder-cn/projects/`, `~/.qoderwork/projects/` | Active-branch dialogue and searchable branch history, including nested subagents |
 | **Pi** | `~/.pi/agent/sessions/` | Reconstructs active branch via last persisted parent chain, keeping earlier turns along the path |
 | **Kimi Code** | `~/.kimi-code/sessions/` | Committed main-agent messages, deduplicating replay events |
 | **Devin CLI** | `~/.local/share/devin/cli/sessions.db` | Read-only SQLite query along the active message branch |
@@ -95,6 +95,8 @@ Install separately for each client. In a new Codex App chat, type `$pickup` and 
 
 ## Usage
 
+Open a known ID or link directly with `show`. When a search result already gives a turn, run its `open match` command or use `read <uid> --turns X-Y`. Use the outline to choose turns when needed.
+
 Run from the repository root (or replace `python3 scripts/pickup.py` with `pickup` if aliased).
 
 ### 1. Find candidates
@@ -118,11 +120,11 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 ```
 
 - **Discovery only — never auto-loads #1**: without a query, candidates sort by file modification time; with a query, matches in parsed titles, summaries, and dialogue outrank tool-output matches.
-- Automatically excludes the active session when the caller runtime supplies its session ID; use `--exclude` otherwise.
+- A local session ID supplied by the caller excludes the current session. Use `--exclude` when the environment has no ID. For Claude Code, a caller can supply `CLAUDE_SESSION_ID` from the hook input `session_id`. [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
 - Keyword matches include the source role, turn and text snippet to help assess candidates. `--agent` limits sources before discovery.
 - `--project` matches workspace paths. `--since` includes records modified on or after the given local date. These filters can skip transcript reads when the relevant metadata is available. `--model` matches names recorded in Codex, Antigravity, Claude Code and Qoder transcripts, including sessions that switched models.
-- Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. When a later user message shares a long passage containing the clue with an earlier assistant reply in another session, the later match ranks lower and is labeled `probable repost`. Use `open match` to read the matched turn or tool excerpt.
-- `Scan coverage` goes to stderr. A `partial` status indicates a coverage gap. Check `failed`, `discovery_failed`, `metadata_only`, `unscanned` and any decode warnings. For Antigravity sessions with metadata only, use `show` for the title and workspace. Reading and exporting require a local transcript.
+- Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. A later user message ranks lower when it cites the matching assistant session or repeats a substantial part of the assistant reply. Use `open match` to read the passage.
+- `Scan coverage` goes to stderr. Check `failed`, `discovery_failed`, `metadata_only`, `indexed_text`, `sqlite_history`, `unscanned` and any decode warnings. `prefiltered` counts files ruled out for the query. When this count is positive, the coverage status says that the raw prefilter skipped JSON validation for those files. Metadata-only records can still supply titles and workspace paths.
 
 ### 2. Inspect overview & outline (`show`)
 
@@ -132,9 +134,9 @@ python3 scripts/pickup.py show '<uid>' --tail 2
 python3 scripts/pickup.py show 'codex://threads/<full-session-id>'
 ```
 
-Returns a compact outline of **user prompts (`Turn 1..N`)**, plus shortened recent turns, tool call trails, and available errors or background task logs. When several files share a session ID, use the record UID with an `@` suffix from the candidate list or ambiguity message.
+Returns an outline of user prompts, shortened recent turns, tool call summaries, and available errors or background task logs. When several files share a session ID, use the record UID with an `@` suffix from the candidate list or ambiguity message.
 
-Open a local Codex or Antigravity subagent session by ID or session link. Keyword searches and recent lists default to main sessions. Add `--include-subagents` to include subagent sessions from those two clients.
+Open local Antigravity, Codex, Claude Code, and Qoder subagents by ID. Keyword searches and recent lists default to main sessions. Add `--include-subagents` to include subagents.
 
 ### 3. Read deeper on demand (`read`)
 
@@ -148,13 +150,17 @@ python3 scripts/pickup.py read '<uid>' --turns 8-20
 # Search across dialogue and retained tool records inside one session
 python3 scripts/pickup.py read '<uid>' --grep 'build'
 
-# Include raw tool output snippets
+# Include brief tool output snippets
 python3 scripts/pickup.py read '<uid>' --turns 8-20 --with-tools
 ```
 
-`show` and `read` default to at most 12,000 characters per page; use `--max-chars` to adjust it (minimum 1,024). Check the final `complete=yes/no` and `view` markers, and run each continuation command until that view reports `complete=yes`. The cursor restores the original filters; if a changed source invalidates it, restart that view. Avoid truncating the output with `head`, which can hide continuation information.
+`--with-tools` adds brief snippets. For exact commands, exit codes, call IDs, or subagent spawns, inspect `source_file` or export the raw records if available.
 
-Completion applies only to the selected view. `show` gives an overview, `read` contains dialogue and tool summaries, and `--with-tools` includes snippets of tool output. The continuation command preserves a custom page size.
+`show` and `read` default to 8,000 UTF-8 bytes per page, including the header and footer. `--max-bytes` adjusts that limit. `--max-chars` alone sets a character limit of at least 1,024 and permits up to four bytes per character. Supply both flags to enforce both limits.
+
+Follow each `Next:` command until the selected view reports `complete=yes`. The cursor restores view options, and the continuation command preserves custom page limits. If the source changes, run the printed `Restart with:` command. If tool output is clipped, use a smaller `--max-bytes` and capture the footer.
+
+Qoder `show`, `read`, and Markdown export follow the active branch by default. Search and `read --grep` include historical branches. To read a match marked `off-branch`, add `--all-branches --turns X`. Variants of the same prompt share a turn number, and active branches may have gaps in turn numbers.
 
 ### 4. Export to a file (`export`)
 
@@ -165,6 +171,8 @@ python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/sessi
 ```
 
 Markdown export saves the full decoded dialogue and tool summaries. Add `--with-tools` for output snippets. Raw export copies the selected file's bytes. Keep the original extension, such as `.jsonl.zst` for compressed sources. For Kimi Code, the source is the main agent's wire log. For Devin CLI, the raw export is JSONL with the selected session's message nodes and active branch pointer. Choose a new output path.
+
+If the transcript is missing, Antigravity can use indexed text from `conversations_fts` and Codex can use projected user and assistant messages from `thread_items`. Search, `show`, `read`, and Markdown export label the fallback. These records have no raw export or tool details. The Antigravity CLI binary step stores are outside this support.
 
 ### Using pickup in chat
 
@@ -199,7 +207,9 @@ pickup/
 ├── assets/cover.jpg          # README cover banner
 ├── scripts/
 │   ├── pickup.py             # Core CLI: discovery, show, paginated read & adapters
-│   ├── pickup_extra.py       # Kimi Code / Devin CLI readers
+│   ├── pickup_extra.py       # SQLite stores, Kimi wire logs, Qoder branch graph
+│   ├── pickup_paging.py      # Bounded pages and cursor recovery
+│   ├── pickup_scan.py        # Text prefilter and scan coverage
 │   └── pickup_pi.py          # Pi persisted-branch resolver
 └── tests/                    # Offline automated tests
 ```

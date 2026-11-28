@@ -41,12 +41,12 @@
 
 | 工具 | 默认本地记录位置 | 读取范围与细节 |
 | :--- | :--- | :--- |
-| **Antigravity** | `~/.gemini/antigravity/` | 优先读取会话正文和近期任务日志，缺少正文时可只读查询 `conversations_fts` |
+| **Antigravity** | `~/.gemini/antigravity/`、`~/.gemini/antigravity-cli/` | 优先读取会话正文和近期任务日志，缺少正文时可只读查询 `conversations_fts` |
 | **Codex** | `~/.codex/sessions/`、`~/.codex/archived_sessions/`、`~/.codex/thread_history_1.sqlite` | 优先读取 JSONL 和 `.jsonl.zst`，缺少日志时可只读查询 SQLite 对话 |
 | **Claude Code** | `~/.claude/projects/` | 项目会话和嵌套子代理的 JSONL，兼容由多个文本块组成的工具结果 |
 | **Qoder** | `~/.qoder/projects/`、`~/.qoder-cn/projects/`、`~/.qoderwork/projects/` | 读取活动分支并搜索历史分支，支持嵌套子代理 |
 | **Pi** | `~/.pi/agent/sessions/` | 按最后持久化节点的父链还原当前分支，保留该路径上的早期对话 |
-| **Kimi Code** | `~/.kimi-code/sessions/` | 主 Agent 已提交消息，自动跳过重复回放事件 |
+| **Kimi Code** | `~/.kimi-code/sessions/` | 读取主代理和子代理已提交的消息，跳过重复回放事件 |
 | **Devin CLI** | `~/.local/share/devin/cli/sessions.db` | 只读打开 SQLite，沿当前活跃消息分支还原 |
 
 > 适配器基于 macOS 上实际观察到的存储格式实现。同一存储结构在其他类 Unix 系统上通常同样适用，但尚未全面实测；客户端升级后存储格式可能发生变化。云端专有会话、二进制附件与子 Agent 独立历史不在完整性保证范围内。
@@ -55,7 +55,7 @@
 
 ## 快速安装
 
-需要 **Python 3.10+**。读取 Zstandard 压缩的 Codex 记录需要 Python 3.14 的标准库或系统上的 `zstd` 命令。
+需要 **Python 3.9+**。读取 Zstandard 压缩的 Codex 记录时，优先使用 Python 3.14+ 的标准库，其次使用系统的 `libzstd` 或 `zstd` 命令。
 
 ### 1. 克隆仓库并验证 CLI
 
@@ -120,7 +120,7 @@ python3 scripts/pickup.py --exclude '<完整会话ID或候选UID>'
 ```
 
 - **只列候选，不盲目加载**：无线索时按文件修改时间排序；有线索时对解析后的标题、摘要、对话与保留的工具记录做文字匹配排序。
-- 调用方传入本地会话 ID 时，脚本会排除当前会话。未传入时可用 `--exclude`。Claude Code 调用方可用 hook 输入的 `session_id` 设置 `CLAUDE_SESSION_ID`。 [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
+- 搜索和列表会排除所有继承的调用方会话 ID，也支持用 `--exclude` 额外排除。已知父会话 ID 时，可直接用 `show` 或 `read` 打开。Claude Code 调用方可用 hook 输入的 `session_id` 设置 `CLAUDE_SESSION_ID`。 [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
 - 关键词命中会显示来源角色、轮次和文本片段，帮助判断候选是否符合线索。`--agent` 在发现阶段就限制来源。
 - `--project` 匹配工作区路径，`--since` 匹配本地日期当天或之后修改的记录。对已有工作区路径的会话，这两个筛选可以在读取正文前缩小范围。`--model` 匹配 Codex、Antigravity、Claude Code 和 Qoder 正文里记录的模型名，包含曾切换模型的会话。
 - 标题、工作区名和对话中的原句优先。较晚的用户消息如果引用了命中的会话 ID，或复述了早期助手回复中的一段内容，就会降低排序。候选里的 `open match` 命令可打开命中轮次或工具结果片段。
@@ -138,7 +138,7 @@ python3 scripts/pickup.py show 'codex://threads/<完整会话ID>'
 
 输出包含用户提问大纲、最近几轮的缩略对话、简短的工具调用摘要与可用的错误或后台任务日志。如果多个文件记录了同一个会话 ID，使用候选或错误提示里带有 `@` 后缀的记录 UID 打开对应文件。
 
-本机有记录的 Antigravity、Codex、Claude Code 和 Qoder 子代理可以用 ID 直接打开。关键词搜索和最近列表默认查看主会话，加 `--include-subagents` 会同时查找子代理。
+本机有记录的 Antigravity、Codex、Claude Code、Qoder 和 Kimi Code 子代理可以用 ID 直接打开。关键词搜索和最近列表默认查看主会话，加 `--include-subagents` 会同时查找子代理。Kimi Code 子代理的 UID 包含父会话 ID，例如 `kimi:<session-id>/agent-0`。
 
 ### 第三步：按需深读或全文通读（`read`）
 
@@ -172,9 +172,9 @@ python3 scripts/pickup.py export '<uid>' --turns 8-10 --turns 15 --output ~/Down
 python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/session.jsonl
 ```
 
-Markdown 导出包含完整的解码对话和工具摘要，可加 `--with-tools` 保存工具输出片段。原始导出复制所选记录的字节，请沿用源文件扩展名，压缩记录用 `.jsonl.zst`。Kimi Code 导出主 Agent 的 wire 日志，Devin CLI 导出所选会话的消息节点和当前分支指针。导出需要填写一个新文件路径。
+Markdown 导出包含完整的解码对话和工具摘要，可加 `--with-tools` 保存工具输出片段。原始导出复制所选记录的字节，请沿用源文件扩展名，压缩记录用 `.jsonl.zst`。Kimi Code 导出所选代理的 wire 日志，Devin CLI 导出所选会话的消息节点和当前分支指针。导出需要填写一个新文件路径。
 
-缺少原始日志时，Antigravity 可从 `conversations_fts` 读取索引文本，Codex 可从 `thread_items` 读取 SQLite 保留的用户与助手消息。搜索、概览、阅读和 Markdown 导出会标明来源和保真度。这些来源只提供对话文本，原始导出和工具明细需要原始日志。Antigravity CLI 的二进制步骤库不在支持范围内。
+缺少原始日志时，Antigravity 可从 `conversations_fts` 读取索引文本，Codex 可从 `thread_items` 读取 SQLite 保留的用户与助手消息。搜索、概览、阅读和 Markdown 导出会标明来源和保真度。SQLite 回退适配器目前读取对话轮次。数据库可能也保留工具记录，例如 Codex 的命令执行条目。原始导出需要会话日志。Antigravity CLI 的二进制步骤库不在支持范围内。
 
 ### 在聊天窗口直接调用
 

@@ -35,7 +35,7 @@ from typing import Any
 import pickup_extra
 import pickup_pi
 import pickup_paging
-from pickup_scan import QueryPrefilter, ScanReport
+from pickup_scan import QueryPrefilter, ScanReport, ZstdReader, jsonl_byte_lines, zstd_library
 
 try:
     from compression import zstd
@@ -94,6 +94,8 @@ class SessionMeta:
     stored_model: str = ""
     match_off_branch: bool = False
     indexed_chunks: list[tuple[Any, ...]] | None = field(default=None, repr=False)
+    history_path: pathlib.Path | None = field(default=None, repr=False)
+    history_mtime: float | None = field(default=None, repr=False)
 
 
 SOURCE_FIDELITY = {
@@ -180,71 +182,93 @@ def jsonl_lines(path):
 # Store 1: Antigravity (~/.gemini/antigravity)
 # ---------------------------------------------------------------------------
 
-def discover_antigravity(on_error=None, *, include_subagents=False, batch_indexed_text=False) -> list[SessionMeta]:
-    base = HOME / ".gemini" / "antigravity"
-    brain = base / "brain"
-    if not base.is_dir():
-        return []
+def antigravity_roots():
+    return [HOME / ".gemini" / store for store in ("antigravity", "antigravity-cli")]
 
-    sessions: dict[str, SessionMeta] = {}
-    subagents: set[str] = set()
-    db_path = base / "conversation_summaries.db"
-    if db_path.is_file():
+
+def antigravity_catalog(path):
+    with closing(pickup_extra.open_readonly_db(path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}
+        modified_column = "last_modified_time" if "last_modified_time" in columns else "NULL"
+        rows = conn.execute(
+            "SELECT conversation_id, title, workspace_uris, status, parent_conversation_id, "
+            f"{modified_column} FROM conversation_summaries"
+        ).fetchall()
+    for cid, title, ws_raw, status, parent_id, modified in rows:
+        if not cid:
+            continue
+        workspace = re.search(r"file://([^\s\"'\],]+)", str(ws_raw or ""))
         try:
-            with closing(pickup_extra.open_readonly_db(db_path)) as conn:
-                columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}
-                modified_column = "last_modified_time" if "last_modified_time" in columns else "NULL"
-                rows = conn.execute(
-                    "SELECT conversation_id, title, workspace_uris, status, parent_conversation_id, "
-                    f"{modified_column} FROM conversation_summaries"
-                ).fetchall()
-            for cid, title, ws_raw, status, parent_id, modified in rows:
-                if not cid:
-                    continue
-                if parent_id and not include_subagents:
-                    subagents.add(cid)
-                    continue
-                workspace = re.search(r"file://([^\s\"'\],]+)", str(ws_raw or ""))
-                try:
-                    mtime = dt.datetime.fromisoformat(str(modified).replace("Z", "+00:00")).timestamp()
-                except (ValueError, OSError, OverflowError):
-                    mtime = 0
-                sessions[cid] = SessionMeta(
-                    f"antigravity:{cid[:8]}", "antigravity", cid, db_path, mtime,
-                    cwd=workspace[1] if workspace else "", title=title or "",
-                    status=(status or "").replace("CASCADE_RUN_STATUS_", ""), metadata_only=True,
-                    is_subagent=bool(parent_id),
-                )
+            mtime = dt.datetime.fromisoformat(str(modified).replace("Z", "+00:00")).timestamp()
+        except (ValueError, OSError, OverflowError):
+            mtime = 0
+        yield SessionMeta(
+            f"antigravity:{cid[:8]}", "antigravity", cid, path, mtime,
+            cwd=workspace[1] if workspace else "", title=title or "",
+            status=(status or "").replace("CASCADE_RUN_STATUS_", ""), metadata_only=True,
+            is_subagent=bool(parent_id),
+        )
+
+
+def discover_antigravity(on_error=None, *, on_discovery_error=None, include_subagents=False,
+                         batch_indexed_text=False) -> list[SessionMeta]:
+    roots = antigravity_roots()
+    catalogs = [path for root in roots if (path := root / "conversation_summaries.db").is_file()]
+    sessions: dict[str, SessionMeta] = {}
+    for path in catalogs:
+        try:
+            for entry in antigravity_catalog(path):
+                meta = sessions.setdefault(entry.raw_id, entry)
+                meta.is_subagent |= entry.is_subagent
         except (OSError, sqlite3.Error, ValueError, TypeError):
             if on_error:
                 on_error("antigravity", "metadata unavailable; falling back to transcript files")
 
-    for d in brain.iterdir() if brain.is_dir() else ():
-        cid = d.name
-        if cid in subagents:
-            continue
-        logs = d / ".system_generated" / "logs"
-        full = logs / "transcript_full.jsonl"
-        tp = full if full.is_file() else logs / "transcript.jsonl"
-        if not tp.is_file():
-            continue
-        mtime = tp.stat().st_mtime
-        if cid in sessions:
-            meta = sessions[cid]
-            meta.path = tp
-            meta.mtime = mtime
-            meta.metadata_only = False
-        else:
-            sessions[cid] = SessionMeta(f"antigravity:{cid[:8]}", "antigravity", cid, tp, mtime)
-    missing = {cid for cid, meta in sessions.items() if meta.metadata_only}
-    if missing:
+    for root in roots:
+        brain = root / "brain"
         try:
-            indexed = pickup_extra.antigravity_indexed_sessions(db_path, missing, batch_chunks=batch_indexed_text)
+            entries = list(brain.iterdir()) if brain.exists() else []
+        except OSError:
+            if on_discovery_error:
+                on_discovery_error("antigravity", f"cannot enumerate {brain}; source may be incomplete")
+            continue
+        for d in entries:
+            try:
+                cid = d.name
+                meta = sessions.get(cid)
+                if meta and (not meta.metadata_only or meta.is_subagent and not include_subagents):
+                    continue
+                logs = d / ".system_generated" / "logs"
+                full = logs / "transcript_full.jsonl"
+                tp = full if full.is_file() else logs / "transcript.jsonl"
+                if not tp.is_file():
+                    continue
+                mtime = tp.stat().st_mtime
+            except OSError:
+                if on_discovery_error:
+                    on_discovery_error("antigravity", "transcript metadata could not be read")
+                continue
+            if meta:
+                meta.path = tp
+                meta.mtime = mtime
+                meta.metadata_only = False
+            else:
+                sessions[cid] = SessionMeta(f"antigravity:{cid[:8]}", "antigravity", cid, tp, mtime)
+    if not include_subagents:
+        sessions = {cid: meta for cid, meta in sessions.items() if not meta.is_subagent}
+    missing = {cid for cid, meta in sessions.items() if meta.metadata_only}
+    for path in catalogs:
+        if not missing:
+            break
+        try:
+            indexed = pickup_extra.antigravity_indexed_sessions(path, missing, batch_chunks=batch_indexed_text)
             for cid, chunks in indexed.items():
                 meta = sessions[cid]
+                meta.path = path
                 meta.metadata_only = False
                 meta.fidelity = "indexed_text"
                 meta.indexed_chunks = chunks
+            missing.difference_update(indexed)
         except (OSError, sqlite3.Error):
             if on_error:
                 on_error("antigravity", "indexed text unavailable; retaining session metadata")
@@ -396,8 +420,13 @@ def open_codex_log(path, *, header_only=False, binary=False):
         except (zstd.ZstdError, EOFError) as error:
             raise OSError("Invalid Zstandard history") from error
         return
-    # Used on Python versions before 3.14. Closing a header-only read stops
-    # the decoder without consuming the entire historical conversation.
+    lib = zstd_library()
+    if lib is not None:
+        with path.open("rb") as source, io.BufferedReader(ZstdReader(source, lib), 128 * 1024) as buffered:
+            with (buffered if binary else io.TextIOWrapper(buffered, **encoding)) as stream:
+                yield stream
+        return
+    # Keep the command fallback when the shared library is unavailable.
     with subprocess.Popen(["zstd", "-qdc", "--", str(path)], stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL) as process:
         with (process.stdout if binary else io.TextIOWrapper(process.stdout, **encoding)) as stream:
@@ -410,17 +439,70 @@ def codex_roots():
     return [HOME / ".codex" / store for store in ("sessions", "archived_sessions")]
 
 
+def codex_state_db() -> pathlib.Path | None:
+    base = HOME / ".codex"
+    state_files = sorted((p for p in base.glob("state_*.sqlite") if p.stem[6:].isdigit()),
+                         key=lambda p: int(p.stem[6:]), reverse=True)
+    return next(iter(state_files), None)
+
+
+def codex_catalog_session(row, on_error=None):
+    rollout = row.pop("rollout_path")
+    if rollout is not None:
+        try:
+            if not rollout.is_file():
+                raise OSError("Rollout is not a regular file")
+            header_records = []
+            with open_codex_log(rollout, header_only=True) as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if not isinstance(rec, dict) or not isinstance(rec.get("type"), str):
+                        raise ValueError("Expected a rollout record")
+                    header_records.append(rec)
+                    if rec["type"] == "session_meta" or len(header_records) >= 25:
+                        break
+            if not header_records:
+                raise ValueError("Empty rollout")
+            meta_rec = next((r for r in header_records if r["type"] == "session_meta"), None)
+            payload = meta_rec.get("payload") if meta_rec else None
+            if isinstance(payload, dict):
+                declared_id = payload.get("id")
+                if isinstance(declared_id, str) and declared_id and declared_id != row["raw_id"]:
+                    raise ValueError("Rollout ID mismatch")
+            mtime = rollout.stat().st_mtime
+        except (OSError, ValueError):
+            if row["path"] is None and on_error:
+                on_error("codex", "catalog rollout could not be read")
+        else:
+            if isinstance(payload, dict):
+                source = payload.get("source")
+                row["is_subagent"] |= isinstance(source, dict) and "subagent" in source
+                row["cwd"] = payload.get("cwd") or row["cwd"]
+            if row["path"] is not None:
+                row["history_path"] = row["path"]
+                row["history_mtime"] = row["mtime"]
+            row.update(path=rollout, mtime=mtime, location="rollout")
+    if row["path"] is None:
+        return None
+    if "location" not in row:
+        row.update(location="sqlite", fidelity="sqlite_history")
+    return SessionMeta(uid=f"codex:{row['raw_id'][-8:]}", agent="codex", **row)
+
+
 def discover_codex(on_error=None, *, include_subagents=False) -> list[SessionMeta]:
     out: list[SessionMeta] = []
     file_ids = set()
     files = (path for root in codex_roots() for path in root.rglob("*.jsonl*")
              if path.name.endswith((".jsonl", ".jsonl.zst")))
-    has_zstd = zstd is not None or shutil.which("zstd") is not None
-    skipped_compressed = False
+    has_zstd = None
     for f in files:
-        if f.suffix == ".zst" and not has_zstd:
-            skipped_compressed = True
-            continue
+        if f.suffix == ".zst":
+            if has_zstd is None:
+                has_zstd = zstd is not None or zstd_library() is not None or shutil.which("zstd") is not None
+            if not has_zstd:
+                continue
         # Fast header peek (first 25 lines) for session_meta & subagent check
         sid = f.name.removesuffix(".zst").removesuffix(".jsonl")
         cwd = ""
@@ -462,18 +544,18 @@ def discover_codex(on_error=None, *, include_subagents=False) -> list[SessionMet
                 is_subagent=is_subagent,
             )
         )
-    if skipped_compressed and on_error:
-        on_error("codex", "compressed records require Python 3.14 or the zstd command")
+    if has_zstd is False and on_error:
+        on_error("codex", "compressed records require Python 3.14, libzstd, or the zstd command")
     base = HOME / ".codex"
-    state_files = sorted((p for p in base.glob("state_*.sqlite") if p.stem[6:].isdigit()),
-                         key=lambda p: int(p.stem[6:]), reverse=True)
     try:
         rows = pickup_extra.discover_codex_history(
-            base / "thread_history_1.sqlite", next(iter(state_files), None), file_ids, on_error=on_error,
+            base / "thread_history_1.sqlite", codex_state_db(), file_ids, on_error=on_error,
         )
-        out.extend(SessionMeta(uid=f"codex:{row['raw_id'][-8:]}", agent="codex", location="sqlite",
-                               fidelity="sqlite_history", **row)
-                   for row in rows if include_subagents or not row["is_subagent"])
+        for row in rows:
+            if include_subagents or not row["is_subagent"]:
+                meta = codex_catalog_session(row, on_error=on_error)
+                if meta is not None and (include_subagents or not meta.is_subagent):
+                    out.append(meta)
     except (OSError, sqlite3.Error, ValueError, TypeError):
         if on_error:
             on_error("codex", "SQLite history unavailable; falling back to rollout files")
@@ -499,15 +581,6 @@ def parse_codex_turns(meta: SessionMeta, *, search_only=False, prefilter=None) -
     with open_codex_log(meta.path, binary=search_only) as stream:
         lines = jsonl_byte_lines(stream) if search_only else stream
         return parse_codex_records(meta, lines, search_only=search_only, prefilter=prefilter)
-
-
-def jsonl_byte_lines(stream):
-    # Match the text reader's support for CRLF and older CR line boundaries.
-    for line in stream:
-        if b"\r" in line:
-            yield from line.splitlines()
-        else:
-            yield line
 
 
 def parse_codex_records(meta: SessionMeta, lines, *, search_only=False, prefilter=None) -> tuple[list[Turn], list[str]]:
@@ -874,13 +947,14 @@ AGENTS = ("antigravity", "codex", "claude", "qoder", "pi", "kimi", "devin")
 
 def discover_all(agents=None, report=None, *, include_subagents=False, batch_indexed_text=False) -> list[SessionMeta]:
     selected = AGENTS if agents is None else agents
+    state_db = codex_state_db()
     roots = {
-        "antigravity": [HOME / ".gemini/antigravity/brain", HOME / ".gemini/antigravity/conversation_summaries.db"],
-        "codex": [*codex_roots(), HOME / ".codex/thread_history_1.sqlite"],
+        "antigravity": [root / name for root in antigravity_roots() for name in ("brain", "conversation_summaries.db")],
+        "codex": [*codex_roots(), HOME / ".codex/thread_history_1.sqlite", *([state_db] if state_db else [])],
         "claude": [HOME / ".claude/projects"],
         "qoder": [HOME / ".qoder/projects", HOME / ".qoder-cn/projects", HOME / ".qoderwork/projects"],
         "pi": [HOME / ".pi/agent/sessions"],
-        "kimi": [HOME / ".kimi-code/sessions"],
+        "kimi": [path / "sessions" for path in sorted(HOME.glob(".kimi*")) if path.is_dir()] if "kimi" in selected else [],
         "devin": [HOME / ".local/share/devin/cli/sessions.db"],
     }
     def diagnostic(agent, reason):
@@ -891,6 +965,7 @@ def discover_all(agents=None, report=None, *, include_subagents=False, batch_ind
     loaders = {
         "antigravity": lambda: discover_antigravity(
             on_error=(lambda ag, why: report.warning(ag, why)) if report else None,
+            on_discovery_error=diagnostic,
             include_subagents=include_subagents,
             batch_indexed_text=batch_indexed_text,
         ),
@@ -898,7 +973,9 @@ def discover_all(agents=None, report=None, *, include_subagents=False, batch_ind
         "claude": lambda: discover_claude_like("claude", roots["claude"], include_subagents=include_subagents),
         "qoder": lambda: discover_claude_like("qoder", roots["qoder"], include_subagents=include_subagents),
         "pi": discover_pi,
-        "kimi": lambda: pickup_extra.discover_kimi(roots["kimi"][0], on_error=diagnostic),
+        "kimi": lambda: [row for root in roots["kimi"]
+                         for row in pickup_extra.discover_kimi(root, on_error=diagnostic,
+                                                               include_subagents=include_subagents)],
         "devin": lambda: pickup_extra.discover_devin(roots["devin"][0], on_error=diagnostic),
     }
     items = []
@@ -911,7 +988,8 @@ def discover_all(agents=None, report=None, *, include_subagents=False, batch_ind
             if agent in ("kimi", "devin"):
                 found = [SessionMeta(uid=f"{agent}:{data['raw_id']}", agent=agent,
                          raw_id=data["raw_id"], path=pathlib.Path(data["path"]),
-                         mtime=data["mtime"], cwd=data["cwd"], title=data["title"]) for data in found]
+                         mtime=data["mtime"], cwd=data["cwd"], title=data["title"],
+                         is_subagent=data.get("is_subagent", False)) for data in found]
         except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
             diagnostic(agent, "source discovery failed; this source may be incomplete")
             found = []
@@ -960,6 +1038,19 @@ def parse_session(meta: SessionMeta, use_full: bool = True, *, search_only=False
 
 def _parse_session(meta: SessionMeta, use_full: bool = True, *, search_only=False,
                    all_branches=False, prefilter=None) -> tuple[list[Turn], list[str]]:
+    if meta.history_path is not None:
+        try:
+            turns, notes = parse_codex_turns(meta, search_only=search_only, prefilter=prefilter)
+            if turns or notes:
+                return turns, notes
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        meta.path, meta.history_path = meta.history_path, None
+        if meta.history_mtime is not None:
+            meta.mtime, meta.history_mtime = meta.history_mtime, None
+        meta.location, meta.fidelity = "sqlite", "sqlite_history"
+        meta.parse_warnings = 0
+        meta.models.clear()
     if meta.fidelity:
         if meta.stored_model:
             meta.models.add(meta.stored_model)
@@ -969,10 +1060,11 @@ def _parse_session(meta: SessionMeta, use_full: bool = True, *, search_only=Fals
 
         messages = (pickup_extra.antigravity_indexed_messages(meta.path, meta.raw_id, chunks=meta.indexed_chunks)
                     if meta.fidelity == "indexed_text" else
-                    pickup_extra.codex_history_messages(meta.path, meta.raw_id, on_error=decode_warning))
+                    pickup_extra.codex_history_messages(meta.path, meta.raw_id, on_error=decode_warning,
+                                                        clean_user_text=codex_user_text))
         turns = []
         for role, text, stamp in messages:
-            text = codex_user_text(text) if role == "user" and meta.agent == "codex" else text.strip()
+            text = text.strip()
             if not text:
                 continue
             if role == "user" or not turns:
@@ -1044,14 +1136,14 @@ def resolve_by_id(all_metas: list[SessionMeta], target: str) -> SessionMeta | No
 
 
 def source_may_match(meta, prefilter):
-    if not prefilter.anchor or meta.fidelity or meta.agent not in ("codex", "qoder", "claude"):
+    if not prefilter.anchor or meta.fidelity or meta.history_path or meta.agent not in ("codex", "qoder", "claude"):
         return True
     metadata = "\n".join((meta.title, meta.cwd, meta.uid, meta.raw_id, meta.agent))
     if prefilter.required in metadata.lower():
         return True
     try:
         if meta.agent == "codex":
-            if meta.path.suffix == ".zst" and zstd is None:
+            if meta.path.suffix == ".zst" and zstd is None and zstd_library() is None:
                 return True  # The external decoder's exit status is checked during the full scan.
             with open_codex_log(meta.path, binary=True) as stream:
                 return prefilter.may_match(stream, ignored=CODEX_NON_SEARCH_BYTES)
@@ -1076,7 +1168,8 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
     excluded = caller_session_ids() | (excluded or set())
     identity_matches = {id(m) for m in matching_ids(all_metas, q)} if by_id else set()
     for meta in all_metas:
-        if (is_excluded(meta, excluded) or (since is not None and meta.mtime < since)
+        max_mtime = max(meta.mtime, meta.history_mtime) if meta.history_mtime is not None else meta.mtime
+        if (is_excluded(meta, excluded) or (since is not None and max_mtime < since)
                 or (project and meta.cwd and project not in meta.cwd.lower())):
             if report:
                 report.excluded(meta.agent)
@@ -1108,6 +1201,8 @@ def find_matching_sessions(all_metas: list[SessionMeta], query: str | None, limi
                     report.warning(meta.agent, "some source records or branches could not be decoded")
             if not turns and not notes:
                 continue
+        if since is not None and meta.mtime < since:
+            continue
         if project and project not in meta.cwd.lower():
             continue
         if model and not any(model in name.lower() for name in meta.models):
@@ -1387,11 +1482,15 @@ def turn_bounds(turn_range):
     return start, end
 
 
+class NoTurnsInRange(ValueError):
+    pass
+
+
 def select_turns(turns, turn_range, *, require_full_range=False):
     start, end = turn_bounds(turn_range)
     selected = [turn for turn in turns if start <= turn.index <= end]
     if not selected:
-        raise ValueError(f"No turns in requested range ({turn_range}); this session has {len(turns)} turns")
+        raise NoTurnsInRange(f"No turns in requested range ({turn_range}); this session has {len(turns)} turns")
     last_index = max(turn.index for turn in turns)
     if require_full_range and end > last_index:
         raise ValueError(f"Requested range ({turn_range}) exceeds the last turn ({last_index})")
@@ -1510,13 +1609,13 @@ def load_selected_meta(target):
     return meta
 
 
-def load_decoded(meta, *, all_branches=False):
+def load_decoded(meta, *, all_branches=False, allow_empty=False):
     if meta.metadata_only:
         raise ValueError("Only session metadata is available; the local transcript is missing")
     turns, notes = parse_session(meta, use_full=True, all_branches=all_branches)
     if meta.status == "UNREADABLE":
         raise ValueError("Session could not be read; resolve its source error before retrying")
-    if not turns and not notes:
+    if not turns and not notes and not allow_empty:
         raise ValueError("Session has no readable decoded content")
     return turns, notes
 
@@ -1556,8 +1655,7 @@ def export_session(meta, destination, output_format, with_tools, turn_ranges, *,
             elif meta.agent == "devin":
                 pickup_extra.export_devin_records(meta.path, stream)
             else:
-                source = (meta.path / "agents" / "main" / "wire.jsonl") if meta.agent == "kimi" else meta.path
-                with source.open("rb") as original:
+                with meta.path.open("rb") as original:
                     before = os.fstat(original.fileno())
                     shutil.copyfileobj(original, stream)
                     after = os.fstat(original.fileno())
@@ -1621,8 +1719,8 @@ def main() -> int:
                 raise ValueError("--max-bytes must be positive")
             supplied = {key: value for key, value in vars(args).items()
                         if key not in ("session_id", "max_chars", "max_bytes", "cursor") and value is not None}
-            if args.cursor:
-                state = pickup_paging.decode_cursor(args.cursor)
+            state = pickup_paging.decode_cursor(args.cursor) if args.cursor else None
+            if state:
                 if state["operation"] != operation:
                     raise ValueError("Cursor operation differs; restart the selected view")
                 if supplied:
@@ -1657,20 +1755,31 @@ def main() -> int:
                     raise ValueError("--grep must not be empty")
             meta = load_selected_meta(args.session_id)
             turns, notes = (([], []) if operation == "show" and meta.metadata_only else
-                            load_decoded(meta, all_branches=all_branches or bool(options.get("grep"))))
+                            load_decoded(meta, all_branches=all_branches or bool(options.get("grep")),
+                                         allow_empty=bool(state and options.get("turns"))))
+            selection = meta.uid if meta.record_variant else f"{meta.agent}:{meta.raw_id}"
+            prefix = [sys.executable, str(pathlib.Path(__file__).resolve())]
             if operation == "show":
                 content = render_session_overview(meta, turns, notes, tail_count=options["tail"],
                                                   all_branches=all_branches)
             else:
-                content = render_read_turns(meta, turns, options["turns"], not options["turns"] and not options["grep"],
-                                            options["grep"], options["with_tools"], args.max_chars,
-                                            notes=notes, all_branches=all_branches)
+                try:
+                    content = render_read_turns(meta, turns, options["turns"], not options["turns"] and not options["grep"],
+                                                options["grep"], options["with_tools"], args.max_chars,
+                                                notes=notes, all_branches=all_branches)
+                except NoTurnsInRange as error:
+                    if state:
+                        if not turns and not notes:
+                            raise ValueError("Session changed since the previous page and now has no readable decoded content") from None
+                        notice = pickup_paging.changed_session_error(
+                            state, selection, prefix, args.max_chars, args.max_bytes, options={**options, "turns": None})
+                        raise ValueError(f"{error}\n{notice}") from None
+                    raise
             if meta.parse_warnings:
                 content = "Source decoding: partial; some records or branches were not decoded.\n\n" + content
-            selection = meta.uid if meta.record_variant else f"{meta.agent}:{meta.raw_id}"
             page = pickup_paging.render_page(content, selection,
                         session_fingerprint(meta, turns, notes, content), operation, options,
-                        args.max_chars, args.cursor, command_prefix=[sys.executable, str(pathlib.Path(__file__).resolve())],
+                        args.max_chars, args.cursor, command_prefix=prefix,
                         max_bytes=args.max_bytes)
         except ValueError as error:
             parser.error(str(error))
@@ -1687,7 +1796,7 @@ def main() -> int:
     parser.add_argument("--project", metavar="PATH_TEXT", help="Only search workspaces whose paths contain this text")
     parser.add_argument("--since", metavar="YYYY-MM-DD", help="Only search records modified on or after this local date")
     parser.add_argument("--model", metavar="NAME_TEXT", help="Match model names recorded in Codex, Antigravity, Claude Code, or Qoder transcripts")
-    parser.add_argument("--include-subagents", action="store_true", help="Include local Antigravity, Codex, Claude Code, and Qoder subagents")
+    parser.add_argument("--include-subagents", action="store_true", help="Include local Antigravity, Codex, Claude Code, Qoder, and Kimi Code subagents")
     parser.add_argument("--exclude", action="append", default=[], metavar="ID", help="Exclude an exact full ID or UID; repeatable")
     parser.add_argument("--limit", type=int, default=6, help="Candidate count (default: 6)")
     args = parser.parse_args(argv)

@@ -96,6 +96,25 @@ def _view_flags(operation, options):
     return flags
 
 
+def _budget_flags(max_chars, max_bytes):
+    flags = []
+    if max_chars is not None:
+        flags.extend(("--max-chars", str(max_chars)))
+    if max_bytes is not None:
+        flags.extend(("--max-bytes", str(max_bytes)))
+    return flags
+
+
+def changed_session_error(previous, session_id, prefix, max_chars, max_bytes, *, options=None):
+    if previous["session_id"] != session_id:
+        return ValueError("Cursor belongs to another session; restart the selected view.")
+    operation = previous["operation"]
+    restart = shlex.join([*prefix, operation, session_id,
+                          *_view_flags(operation, previous["options"] if options is None else options),
+                          *_budget_flags(max_chars, max_bytes)])
+    return ValueError(f"Session changed since the previous page.\nRestart with: {restart}")
+
+
 def render_page(
     content: str,
     session_id: str,
@@ -119,11 +138,7 @@ def render_page(
         raise ValueError(f"--max-chars must be at least {MIN_MAX_CHARS}.")
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
         raise ValueError("--max-bytes must be positive.")
-    budget = []
-    if max_chars is not None:
-        budget.extend(("--max-chars", str(max_chars)))
-    if max_bytes is not None:
-        budget.extend(("--max-bytes", str(max_bytes)))
+    budget = _budget_flags(max_chars, max_bytes)
     byte_limit = max_bytes if max_bytes is not None else (max_chars * 4 if max_chars else DEFAULT_MAX_BYTES)
     char_limit = max_chars if max_chars is not None else byte_limit
     if not isinstance(content, str):
@@ -139,9 +154,7 @@ def render_page(
         if previous["session_id"] != session_id:
             raise ValueError("Cursor belongs to another session; restart the selected view.")
         if previous["fingerprint"] != fingerprint:
-            restart = shlex.join([*prefix, previous["operation"], previous["session_id"],
-                                  *_view_flags(previous["operation"], previous["options"]), *budget])
-            raise ValueError(f"Session changed since the previous page.\nRestart with: {restart}")
+            raise changed_session_error(previous, session_id, prefix, max_chars, max_bytes)
         if previous["operation"] != operation or previous["options"] != options:
             raise ValueError("Cursor view options differ; restart the selected view.")
         start = previous["offset"]

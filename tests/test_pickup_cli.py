@@ -108,6 +108,26 @@ class CliTests(unittest.TestCase):
         self.assertIn('较长', retried.stdout)
         self.assertLessEqual(len(retried.stdout.encode('utf-8')), 1500)
 
+    def test_stale_cursor_recovers_when_selected_turn_disappears(self):
+        first_turn = self.message('user', 'remaining prompt')
+        self.write([first_turn, self.message('user', 'removed prompt'),
+                    self.message('assistant', 'long reply ' * 500)])
+        first = self.run_cli('read', self.sid, '--turns', '2', '--with-tools', '--max-bytes', '1400')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        token = self.cursor(first.stdout)
+        self.assertIsNotNone(token)
+        self.write([first_turn])
+        stale = self.run_cli('read', self.sid, '--cursor', token, '--max-bytes', '1400')
+        self.assertEqual(stale.returncode, 2)
+        self.assertEqual(stale.stdout, '')
+        self.assertIn('Session changed', stale.stderr)
+        self.assertIn('No turns in requested range (2)', stale.stderr)
+        restart = shlex.split(re.search(r'^Restart with: (.+)$', stale.stderr, re.MULTILINE)[1])
+        self.assertEqual(restart[2:], ['read', 'codex:' + self.sid, '--with-tools', '--max-bytes', '1400'])
+        retried = self.run_command(restart)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn('remaining prompt', retried.stdout)
+
     def test_nonpositive_view_flags_are_argument_errors(self):
         for operation, flag, value in [('show', '--tail', '0'), ('show', '--tail', '-2'),
                                        ('read', '--max-chars', '-2'), ('read', '--max-bytes', '-2'),
@@ -310,6 +330,21 @@ class CliTests(unittest.TestCase):
                 self.assertIn(marker, read.stdout)
                 self.assertIn('complete=yes', read.stdout)
 
+    def test_nested_caller_ids_are_all_excluded_but_direct_read_still_works(self):
+        for env_var in ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CLAUDE_SESSION_ID', 'ANTIGRAVITY_CONVERSATION_ID'):
+            sid = env_var.lower().replace('_', '-')
+            self.env[env_var] = sid
+            self.write([self.message('user', 'shared context marker')], sid=sid,
+                       path=self.path.with_name(sid + '.jsonl'))
+        self.write([self.message('user', 'shared context marker')])
+        found = self.run_cli('--agent', 'codex', 'shared context marker')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn('excluded=4', found.stderr)
+        self.assertEqual(found.stdout.count('open match:'), 1)
+        parent = self.run_cli('read', 'codex:' + self.env['CODEX_SESSION_ID'])
+        self.assertEqual(parent.returncode, 0, parent.stderr)
+        self.assertIn('shared context marker', parent.stdout)
+
     def test_antigravity_catalog_only_match_has_an_explicit_read_boundary(self):
         root = self.home / '.gemini/antigravity'
         root.mkdir(parents=True)
@@ -453,6 +488,38 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(collision.returncode, 0)
         self.assertIn(ending, markdown.read_text())
 
+    @unittest.skipUnless(pickup.zstd is not None or shutil.which('zstd'), 'Zstandard fixture encoder unavailable')
+    def test_older_python_scans_multiple_zstd_files_with_the_shared_library(self):
+        if pickup.zstd_library() is None:
+            self.skipTest('libzstd unavailable')
+
+        def frame(data):
+            if pickup.zstd is not None:
+                return pickup.zstd.compress(data)
+            return subprocess.run(['zstd', '-qc'], input=data, check=True,
+                                  stdout=subprocess.PIPE, timeout=10).stdout
+
+        for sid in ('compressed-hit', 'compressed-miss'):
+            path = self.path.with_name(sid + ' - 长 [$].jsonl')
+            text = 'unique compressed request' if sid.endswith('hit') else 'other prompt'
+            body = [self.message('user', text), self.message('assistant', 'reply ' * 100_000)]
+            self.write(body, sid=sid, path=path)
+            header, dialogue = path.read_bytes().split(b'\n', 1)
+            path.with_suffix('.jsonl.zst').write_bytes(frame(header + b'\r') + frame(dialogue))
+            path.unlink()
+
+        with patch.object(pickup, 'HOME', self.home), patch.object(pickup, 'zstd', None), \
+                patch.object(subprocess, 'Popen', side_effect=AssertionError('spawned a zstd subprocess')):
+            sessions = pickup.discover_codex()
+            self.assertEqual({item.raw_id for item in sessions}, {'compressed-hit', 'compressed-miss'})
+            found = pickup.find_matching_sessions(sessions, 'unique compressed request')
+            self.assertEqual([meta.raw_id for meta, _, _ in found], ['compressed-hit'])
+            packed = found[0][0].path
+            self.assertEqual(found[0][1][0].assistant_texts, ['reply ' * 99_999 + 'reply'])
+            packed.write_bytes(packed.read_bytes()[:-1])
+            with pickup.open_codex_log(packed, binary=True) as stream, self.assertRaisesRegex(OSError, 'Truncated'):
+                stream.read()
+
     def test_export_selected_ranges_omits_unrelated_turns_and_deduplicates(self):
         self.write([self.message('user', f'question-{i}') for i in range(1, 7)])
         out = self.home / 'selected.md'
@@ -509,6 +576,19 @@ class CliTests(unittest.TestCase):
         missing = self.run_cli('--agent', 'codex', 'strawberry')
         self.assertEqual(missing.returncode, 1, missing.stderr)
         self.assertIn('prefiltered=1', missing.stderr)
+
+    def test_codex_prefilter_keeps_records_after_ignored_cr_delimited_event(self):
+        rows = [{'type': 'session_meta', 'payload': {'id': self.sid}},
+                {'type': 'event_msg', 'payload': {'type': 'notice'}},
+                self.message('user', '本地会话')]
+        header, event, message = [json.dumps({'timestamp': '2025-04-01T09:00:00Z', **row},
+                                             ensure_ascii=False, separators=(',', ':')).encode() for row in rows]
+        self.path.write_bytes(header + b'\n' + event + b'\r' + message + b'\r\n')
+        result = self.run_cli('--agent', 'codex', '本地会话')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('user, Turn 1', result.stdout)
+        read = self.run_cli('read', self.sid, '--grep', '本地会话')
+        self.assertIn('本地会话', read.stdout)
 
     def test_explicit_source_citation_and_directory_listing_rank_below_reply(self):
         for sid, rows, stamp in [
@@ -569,6 +649,68 @@ class CliTests(unittest.TestCase):
         with closing(pickup.pickup_extra.open_readonly_db(db_path)) as db:
             with self.assertRaisesRegex(sqlite3.OperationalError, 'readonly'):
                 db.execute('DELETE FROM conversation_summaries')
+
+    def test_antigravity_cli_native_logs_win_over_index_without_duplicate_ids(self):
+        ids = ['cli-main', 'cli-child', 'shared-id']
+        db_path = self.write_antigravity_index(ids, [
+            (sid, 0, 1, '[[1,0]]', '[]', 'stale indexed marker', '') for sid in ids
+        ])
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute("UPDATE conversation_summaries SET parent_conversation_id='cli-main' "
+                       "WHERE conversation_id='cli-child'")
+
+        def transcript(store, sid, filename, text):
+            path = self.home / '.gemini' / store / 'brain' / sid / '.system_generated/logs' / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({'type': 'USER_INPUT', 'content': text}))
+            return path
+
+        transcript('antigravity-cli', 'cli-main', 'transcript.jsonl', 'short CLI marker')
+        transcript('antigravity-cli', 'cli-main', 'transcript_full.jsonl', 'full CLI marker')
+        transcript('antigravity-cli', 'cli-child', 'transcript.jsonl', 'child CLI marker')
+        transcript('antigravity-cli', 'shared-id', 'transcript_full.jsonl', 'duplicate CLI marker')
+        transcript('antigravity', 'shared-id', 'transcript.jsonl', 'preferred desktop marker')
+        result = self.run_cli('--agent', 'antigravity', 'full CLI marker')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('discovered=2', result.stderr)
+        self.assertIn('indexed_text=0', result.stderr)
+        self.assertEqual(self.run_cli('--agent', 'antigravity', 'child CLI marker').returncode, 1)
+        expanded = self.run_cli('--include-subagents', 'child CLI marker')
+        self.assertEqual(expanded.returncode, 0, expanded.stderr)
+        child = self.run_cli('show', 'antigravity:cli-child')
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertIn('kind: subagent session', child.stdout)
+        self.assertIn('child CLI marker', child.stdout)
+        shared = self.run_cli('read', 'antigravity:shared-id')
+        self.assertIn('preferred desktop marker', shared.stdout)
+        self.assertNotIn('duplicate CLI marker', shared.stdout)
+
+    def test_antigravity_cli_catalog_works_without_desktop_store(self):
+        db_path = self.write_antigravity_index(['cli-child'], [])
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute("UPDATE conversation_summaries SET parent_conversation_id='parent'")
+        root = self.home / '.gemini/antigravity-cli'
+        db_path.parent.rename(root)
+        path = root / 'brain/cli-child/.system_generated/logs/transcript.jsonl'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'type': 'USER_INPUT', 'content': 'CLI-only child marker'}))
+        sid = 'antigravity:cli-child'
+        self.assertEqual(self.run_cli('--agent', 'antigravity', 'CLI-only child marker').returncode, 1)
+        self.assertIn('CLI-only child marker', self.run_cli('read', sid).stdout)
+
+    def test_antigravity_whitespace_index_is_still_searchable_metadata(self):
+        sid = 'whitespace-index'
+        self.write_antigravity_index([sid], [(sid, 0, 1, '[[1,0]]', None, '\n', '\u2003\t')])
+        for query in ('indexed fixture', 'antigravity:' + sid):
+            with self.subTest(query=query):
+                result = self.run_cli('--agent', 'antigravity', query)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('metadata only', result.stdout)
+                self.assertIn('metadata_only=1', result.stderr)
+                self.assertIn('readable=0', result.stderr)
+        show = self.run_cli('show', 'antigravity:' + sid)
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn('view_scope: metadata only', show.stdout)
 
     def test_antigravity_keyword_search_reads_the_index_in_one_pass(self):
         ids = ['indexed-one', 'indexed-two', 'with-transcript']
@@ -638,11 +780,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(raw.returncode, 2)
         self.assertIn('lacks raw events', raw.stderr)
 
+    def test_codex_catalog_loads_external_rollouts_and_falls_back_if_unreadable(self):
+        state = self.home / '.codex/state_5.sqlite'
+        history = self.home / '.codex/thread_history_1.sqlite'
+        fixtures = [('external-only', None), ('external-preferred', 'stale history'),
+                    ('external-corrupt', 'recovered history'), ('external-body-corrupt', 'recovered body')]
+        with closing(sqlite3.connect(state)) as catalog, catalog, closing(sqlite3.connect(history)) as db, db:
+            catalog.execute('CREATE TABLE threads (id, rollout_path)')
+            db.execute('CREATE TABLE thread_items (thread_id, item_type, item_json, created_at_ms, rollout_ordinal, item_id)')
+            for sid, fallback in fixtures:
+                path = self.home / (sid + '.jsonl')
+                if sid == 'external-corrupt':
+                    path.write_text('broken log')
+                elif sid == 'external-body-corrupt':
+                    self.write([], sid=sid, path=path)
+                    with path.open('a') as stream:
+                        stream.write('\nbroken record')
+                else:
+                    self.write([self.message('user', sid + ' marker')], sid=sid, path=path)
+                catalog.execute('INSERT INTO threads VALUES (?, ?)', (sid, str(path)))
+                if fallback:
+                    db.execute('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?)',
+                               (sid, 'agentMessage', json.dumps({'text': fallback}), 1_750_000_000_000, 0, '0'))
+        for sid, fallback in fixtures:
+            with self.subTest(sid=sid):
+                show = self.run_cli('show', 'codex:' + sid)
+                self.assertEqual(show.returncode, 0, show.stderr)
+                if 'corrupt' in sid:
+                    self.assertIn('SQLite projected dialogue', show.stdout)
+                    self.assertIn(fallback, show.stdout)
+                else:
+                    self.assertIn(str(self.home / (sid + '.jsonl')), show.stdout)
+                    self.assertIn(sid + ' marker', show.stdout)
+                    self.assertNotIn('SQLite projected dialogue', show.stdout)
+        found = self.run_cli('--agent', 'codex', 'external-preferred marker')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn('user, Turn 1', found.stdout)
+
     def test_codex_sqlite_image_only_prompts_keep_their_own_replies(self):
         sid = 'images-only-fixture'
         history = self.home / '.codex/thread_history_1.sqlite'
         messages = [
-            ('userMessage', {'content': [{'type': 'text', 'text': 'original text question'}]}),
+            ('userMessage', {'content': [
+                {'type': 'text', 'text': '<environment_context>discard this context</environment_context>'},
+                {'type': 'text', 'text': 'original text question'},
+                {'type': 'localImage', 'path': '/fixture/first.png'},
+            ]}),
             ('agentMessage', {'text': 'original text answer'}),
             ('userMessage', {'content': [{'type': 'localImage', 'path': '/fixture/photo.png'}]}),
             ('agentMessage', {'text': 'local image answer'}),
@@ -655,6 +838,14 @@ class CliTests(unittest.TestCase):
                 (sid, kind, json.dumps(item), 1_750_000_000_000, index, str(index))
                 for index, (kind, item) in enumerate(messages)
             ])
+        first = self.run_cli('read', 'codex:' + sid, '--turns', '1')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('original text question', first.stdout)
+        self.assertIn('[Image attachment: /fixture/first.png]', first.stdout)
+        self.assertNotIn('discard this context', first.stdout)
+        found = self.run_cli('--agent', 'codex', 'original text question')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn('user, Turn 1', found.stdout)
         for turn, image, reply in [('2', '[Image attachment: /fixture/photo.png]', 'local image answer'),
                                    ('3', '[Image attachment]', 'remote image answer')]:
             with self.subTest(turn=turn):
@@ -685,8 +876,49 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(found.returncode, 0, found.stderr)
                 self.assertIn(uid, found.stdout)
 
+    def test_kimi_subagent_ids_are_scoped_and_open_the_selected_wire_log(self):
+        for root, sid, marker in (('.kimi-code', 'parent-one', 'first unique child'),
+                                  ('.kimi-test', 'parent-two', 'second unique child')):
+            session = self.home / root / 'sessions' / 'wd_project' / ('session_' + sid)
+            for agent, text in (('main', 'main prompt'), ('agent-0', marker)):
+                wire = session / 'agents' / agent / 'wire.jsonl'
+                wire.parent.mkdir(parents=True)
+                wire.write_text(json.dumps({'type': 'agent.message.appended',
+                                            'message': {'message': {'role': 'user', 'content': text}}}))
+            (session / 'state.json').write_text(json.dumps({'id': sid, 'cwd': '/fixture', 'title': 'Kimi fixture'}))
+        uid = 'kimi:parent-two/agent-0'
+        default = self.run_cli('--agent', 'kimi')
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertNotIn('/agent-0', default.stdout)
+        self.assertEqual(self.run_cli('--agent', 'kimi', 'second unique child').returncode, 1)
+        listed = self.run_cli('--agent', 'kimi', '--include-subagents')
+        self.assertIn('kimi:parent-one/agent-0', listed.stdout)
+        self.assertIn(uid, listed.stdout)
+        found = self.run_cli('--agent', 'kimi', '--include-subagents', 'second unique child')
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertIn(uid, found.stdout)
+        self.assertNotIn('first unique child', found.stdout)
+        show = self.run_cli('show', uid)
+        self.assertIn('kind: subagent session', show.stdout)
+        self.assertIn('second unique child', show.stdout)
+        read = self.run_cli('read', 'parent-two/agent-0')
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertIn('second unique child', read.stdout)
+        for form in ('raw', 'markdown'):
+            dest = self.home / f'child-{form}'
+            exported = self.run_cli('export', uid, '--format', form, '-o', str(dest))
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            self.assertIn('second unique child', dest.read_text())
+            if form == 'raw':
+                wire = self.home / '.kimi-test/sessions/wd_project/session_parent-two/agents/agent-0/wire.jsonl'
+                self.assertEqual(dest.read_bytes(), wire.read_bytes())
+
     def test_locked_sqlite_history_leaves_rollout_readable(self):
-        self.write([self.message('user', 'rollout still readable')])
+        external = self.home / 'elsewhere.jsonl'
+        self.write([self.message('user', 'rollout still readable')], path=external)
+        with closing(sqlite3.connect(self.home / '.codex/state_5.sqlite')) as catalog, catalog:
+            catalog.execute('CREATE TABLE threads (id, rollout_path)')
+            catalog.execute('INSERT INTO threads VALUES (?, ?)', (self.sid, str(external)))
         with closing(sqlite3.connect(self.home / '.codex/thread_history_1.sqlite')) as db:
             db.execute('BEGIN EXCLUSIVE')
             db.execute('CREATE TABLE thread_items (thread_id)')
@@ -807,6 +1039,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(re.findall(r'^parallel marker \d+$', hit.stdout, re.MULTILINE), outputs)
         self.assertEqual(hit.stdout.count('### Turn 1 '), 1)
         self.assertNotIn('[off-branch]', hit.stdout)
+
+    def test_qoder_late_parallel_result_is_attached_to_its_call_turn(self):
+        row = self.qoder_row
+        uid = self.write_qoder_graph('late-result', [
+            row('user', 'first', None, 'first prompt'),
+            row('assistant', 'call', 'first', [
+                {'type': 'tool_use', 'id': 'quick', 'name': 'Read'},
+                {'type': 'tool_use', 'id': 'slow', 'name': 'Read'},
+            ]),
+            row('user', 'quick-result', 'call', [
+                {'type': 'tool_result', 'tool_use_id': 'quick', 'content': 'quick output'},
+            ]),
+            row('user', 'second', 'quick-result', 'second prompt'),
+            row('user', 'slow-result', 'call', [
+                {'type': 'tool_result', 'tool_use_id': 'slow', 'content': 'late sibling output'},
+            ]),
+            row('assistant', 'end', 'second', 'second reply'),
+            {'type': 'active-leaf', 'leafUuid': 'end'},
+        ])
+        first = self.run_cli('read', uid, '--turns', '1', '--with-tools')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('late sibling output', first.stdout)
+        second = self.run_cli('read', uid, '--turns', '2', '--with-tools')
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn('second reply', second.stdout)
+        self.assertNotIn('late sibling output', second.stdout)
 
 
 if __name__ == '__main__':

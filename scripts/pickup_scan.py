@@ -2,8 +2,13 @@
 
 The report writes only to stderr by default; conversation output belongs on stdout.
 """
+import ctypes
+import ctypes.util
+from functools import lru_cache
 import io
+from pathlib import Path
 import re
+import shutil
 import sys
 import time
 
@@ -12,6 +17,7 @@ import time
 # Han characters. Restrict anchors to characters with known lowercase rules.
 _ANCHORS = re.compile(r'[ghijklmopqswyz][a-z]*|[\u3400-\u9fff]+')
 _GENERATED_TEXT = '(initial) [image attachment: ] tool true false none nan inf'
+_UNEXPECTED_NEWLINE = re.compile(rb'\n(?:(?<!}\n)(?<!}\r\n)|(?!\{|\Z))')
 
 
 def _anchor(token):
@@ -29,6 +35,15 @@ def _has_unicode_escape(data):
             return True
         offset = data.find(b'\\u', offset + 2)
     return False
+
+
+def jsonl_byte_lines(stream):
+    # Match the text reader's support for CRLF and older CR line boundaries.
+    for line in stream:
+        if b'\r' in line:
+            yield from line.splitlines()
+        else:
+            yield line
 
 
 class QueryPrefilter:
@@ -66,17 +81,86 @@ class QueryPrefilter:
         while block := stream.read(256 * 1024):
             if not block.endswith(b'\n'):
                 block += stream.readline()
-            boundaries = block.count(b'\n') - block.endswith(b'\n')
             if (not block.startswith(b'{') or not block.endswith((b'}\n', b'}\r\n', b'}'))
-                    or boundaries != block.count(b'}\n{') + block.count(b'}\r\n{')):
+                    or _UNEXPECTED_NEWLINE.search(block)):
                 # Defer unexpected record boundaries to the decoder.
                 return True
             if not self.line_may_match(block):
                 continue
             if ignored is None or any(not ignored.match(line) and self.line_may_match(line)
-                                      for line in io.BytesIO(block)):
+                                      for line in jsonl_byte_lines(io.BytesIO(block))):
                 return True
         return False
+
+
+class _ZstdBuffer(ctypes.Structure):
+    _fields_ = [('data', ctypes.c_void_p), ('size', ctypes.c_size_t), ('pos', ctypes.c_size_t)]
+
+
+@lru_cache(maxsize=1)
+def zstd_library():
+    """Find the system library, including Homebrew beside the zstd executable."""
+    command = shutil.which('zstd')
+    sibling = Path(command).resolve().parent.parent / 'lib' / 'libzstd.dylib' if command else None
+    for name in (sibling, ctypes.util.find_library('zstd')):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(str(name))
+            lib.ZSTD_createDStream.argtypes = []
+            lib.ZSTD_createDStream.restype = ctypes.c_void_p
+            lib.ZSTD_freeDStream.argtypes = [ctypes.c_void_p]
+            lib.ZSTD_freeDStream.restype = ctypes.c_size_t
+            lib.ZSTD_decompressStream.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ZstdBuffer),
+                                                  ctypes.POINTER(_ZstdBuffer)]
+            lib.ZSTD_decompressStream.restype = ctypes.c_size_t
+            lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+            lib.ZSTD_isError.restype = ctypes.c_uint
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+class ZstdReader(io.RawIOBase):
+    """Stream frames with libzstd on Python versions without compression.zstd."""
+
+    def __init__(self, source, lib):
+        self._source = source
+        self._lib = lib
+        self._context = lib.ZSTD_createDStream()
+        if not self._context:
+            raise OSError('Cannot allocate Zstandard decoder')
+        self._chunk = b''
+        self._input = _ZstdBuffer()
+        self._remaining = 1  # A complete frame must be seen before EOF.
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if not buffer:
+            return 0
+        target = (ctypes.c_char * len(buffer)).from_buffer(buffer)
+        output = _ZstdBuffer(ctypes.addressof(target), len(buffer), 0)
+        while not output.pos:
+            if self._input.pos == self._input.size:
+                self._chunk = self._source.read(128 * 1024)
+                self._input = _ZstdBuffer(ctypes.cast(self._chunk, ctypes.c_void_p).value, len(self._chunk), 0)
+                if not self._chunk and not self._remaining:
+                    return 0
+            self._remaining = self._lib.ZSTD_decompressStream(self._context, output, self._input)
+            if self._lib.ZSTD_isError(self._remaining):
+                raise OSError('Invalid Zstandard history')
+            if not self._chunk and not output.pos and self._remaining:
+                raise OSError('Truncated Zstandard history')
+        return output.pos
+
+    def close(self):
+        if self._context:
+            self._lib.ZSTD_freeDStream(self._context)
+            self._context = None
+        super().close()
 
 
 class ScanReport:

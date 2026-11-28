@@ -16,9 +16,9 @@ def _time(value):
         return ''
 
 
-def _text(content, *, image_attachments=False):
+def _text(content, *, image_attachments=False, clean_text=None):
     if isinstance(content, str):
-        return content
+        return clean_text(content) if clean_text else content
     if isinstance(content, list):
         parts = []
         for part in content:
@@ -26,7 +26,9 @@ def _text(content, *, image_attachments=False):
                 continue
             kind = part.get('type')
             if kind == 'text' and isinstance(part.get('text'), str):
-                parts.append(part['text'])
+                text = clean_text(part['text']) if clean_text else part['text']
+                if text or not clean_text:
+                    parts.append(text)
             elif image_attachments and kind in ('localImage', 'image'):
                 path = part.get('path')
                 parts.append(f'[Image attachment: {path}]' if isinstance(path, str) and path else '[Image attachment]')
@@ -48,7 +50,7 @@ def _tool(call):
     return f'{name}({args[:90]})' if args else str(name)
 
 
-def discover_kimi(root=None, on_error=None):
+def discover_kimi(root=None, on_error=None, *, include_subagents=False):
     root = Path(root) if root is not None else Path.home() / '.kimi-code' / 'sessions'
     found = []
 
@@ -80,21 +82,30 @@ def discover_kimi(root=None, on_error=None):
             except OSError:
                 report('Cannot read session metadata')
                 continue
-            wire = session / 'agents' / 'main' / 'wire.jsonl'
-            try:
-                info = wire.stat()
-                if not wire.is_file():
-                    continue
-                found.append(dict(raw_id=str(obj.get('id') or session.name.removeprefix('session_')), path=str(session), mtime=info.st_mtime, cwd=obj.get('cwd') or '', title=obj.get('title') or ''))
-            except FileNotFoundError:
-                continue
-            except OSError:
-                report('Cannot inspect session transcript')
+            parent_id = str(obj.get('id') or session.name.removeprefix('session_'))
+            agents = session / 'agents'
+            agent_dirs = [agents / 'main']
+            if include_subagents:
+                agent_dirs.extend(path for path in directories(agents, '') if path.name != 'main')
+            for agent in agent_dirs:
+                wire = agent / 'wire.jsonl'
+                try:
+                    if not wire.is_file():
+                        continue
+                    subagent = agent.name != 'main'
+                    # Agent IDs such as agent-0 are local to their parent session.
+                    found.append(dict(raw_id=f'{parent_id}/{agent.name}' if subagent else parent_id,
+                                      path=wire, mtime=wire.stat().st_mtime, cwd=obj.get('cwd') or '',
+                                      title=obj.get('title') or '', is_subagent=subagent))
+                except OSError:
+                    report('Cannot inspect session transcript')
     return found
 
 
 def parse_kimi(path, on_error=None):
-    wire = Path(path) / 'agents' / 'main' / 'wire.jsonl'
+    wire = Path(path)
+    if wire.is_dir():
+        wire = wire / 'agents' / 'main' / 'wire.jsonl'
     turns = []
     with wire.open(encoding='utf-8') as stream:
         for line in stream:
@@ -141,23 +152,24 @@ def antigravity_indexed_sessions(path, session_ids, *, batch_chunks=False):
         if not table:
             return {}
         has_body = "WHERE user_body <> '' OR agent_body <> ''"
-        if not batch_chunks:
-            rows = conn.execute(f"SELECT DISTINCT conversation_id FROM conversations_fts {has_body}")
-            return {sid: None for (sid,) in rows if sid in session_ids}
-
         # conversation_id is UNINDEXED. Read the table once for a corpus search.
-        rows = conn.execute(f'SELECT conversation_id, {_INDEXED_CHUNK_COLUMNS} FROM conversations_fts '
-                            f'{has_body} {_INDEXED_CHUNK_ORDER}')
+        columns = _INDEXED_CHUNK_COLUMNS if batch_chunks else 'user_body, agent_body'
+        order = _INDEXED_CHUNK_ORDER if batch_chunks else ''
+        rows = conn.execute(f'SELECT conversation_id, {columns} FROM conversations_fts {has_body} {order}')
         chunks = {}
         for row in rows:
             sid = row[0]
-            if sid in session_ids:
+            if sid not in session_ids or not any(body and body.strip() for body in row[-2:]):
+                continue
+            if batch_chunks:
                 chunks.setdefault(sid, []).append(row[1:])
+            else:
+                chunks[sid] = None
         return chunks
 
 
 def _indexed_steps(body, offsets, first_step):
-    if not body:
+    if not body or not body.strip():
         return []
     raw = body.encode('utf-8')
     try:
@@ -197,8 +209,6 @@ def antigravity_indexed_messages(path, session_id, *, chunks=None):
 
 
 def discover_codex_history(path, state_path, file_ids, *, on_error=None):
-    if not path.is_file():
-        return []
     catalog, children = {}, set()
     if state_path is not None:
         try:
@@ -212,32 +222,41 @@ def discover_codex_history(path, state_path, file_ids, *, on_error=None):
         except (OSError, sqlite3.Error):
             if on_error:
                 on_error('codex', 'SQLite thread metadata unavailable; reading history without it')
-    with closing(open_readonly_db(path)) as conn:
-        ids = {row[0] for row in conn.execute('SELECT DISTINCT thread_id FROM thread_items')}
-        sessions = []
-        for sid in sorted(ids - file_ids):
-            rollout, cwd, title, source, updated, model, agent_role = catalog.get(sid, (None,) * 7)
-            if rollout and Path(rollout).is_file():
-                continue
-            # Look at each orphan only. Existing rollouts remain the primary source.
-            stamp = conn.execute(
-                "SELECT max(created_at_ms) FROM thread_items WHERE thread_id = ? "
-                "AND item_type IN ('userMessage', 'agentMessage')", (sid,),
-            ).fetchone()[0]
-            if stamp is None:
-                continue
-            try:
-                source_data = json.loads(source) if source else None
-            except (ValueError, TypeError):
-                source_data = None
-            sessions.append(dict(raw_id=sid, path=path, mtime=updated or stamp / 1000,
-                                 cwd=cwd or '', title=title or '', stored_model=model or '',
-                                 is_subagent=bool(sid in children or agent_role
-                                                  or isinstance(source_data, dict) and 'subagent' in source_data)))
+    stamps = {}
+    try:
+        if path.is_file():
+            with closing(open_readonly_db(path)) as conn:
+                ids = {row[0] for row in conn.execute('SELECT DISTINCT thread_id FROM thread_items')}
+                for sid in ids - file_ids:
+                    stamp = conn.execute(
+                        "SELECT max(created_at_ms) FROM thread_items WHERE thread_id = ? "
+                        "AND item_type IN ('userMessage', 'agentMessage')", (sid,),
+                    ).fetchone()[0]
+                    if stamp is not None:
+                        stamps[sid] = stamp
+    except (OSError, sqlite3.Error):
+        if on_error:
+            on_error('codex', 'SQLite history unavailable; falling back to rollout files')
+    sessions = []
+    for sid in sorted((stamps.keys() | catalog.keys()) - file_ids):
+        rollout, cwd, title, source, updated, model, agent_role = catalog.get(sid, (None,) * 7)
+        stamp = stamps.get(sid)
+        if not rollout and stamp is None:
+            continue
+        try:
+            source_data = json.loads(source) if source else None
+        except (ValueError, TypeError):
+            source_data = None
+        sessions.append(dict(raw_id=sid, path=path if stamp is not None else None,
+                             rollout_path=Path(rollout) if rollout else None,
+                             mtime=updated or (stamp or 0) / 1000,
+                             cwd=cwd or '', title=title or '', stored_model=model or '',
+                             is_subagent=bool(sid in children or agent_role
+                                              or isinstance(source_data, dict) and 'subagent' in source_data)))
     return sessions
 
 
-def codex_history_messages(path, session_id, on_error):
+def codex_history_messages(path, session_id, on_error, *, clean_user_text):
     with closing(open_readonly_db(path)) as conn:
         rows = conn.execute(
             "SELECT item_type, item_json, created_at_ms FROM thread_items WHERE thread_id = ? "
@@ -249,7 +268,7 @@ def codex_history_messages(path, session_id, on_error):
                 if not isinstance(item, dict):
                     raise ValueError('expected a message object')
                 if kind == 'userMessage':
-                    yield 'user', _text(item.get('content'), image_attachments=True), stamp
+                    yield 'user', _text(item.get('content'), image_attachments=True, clean_text=clean_user_text), stamp
                 else:
                     yield 'assistant', _text(item.get('text')), stamp
             except (ValueError, TypeError):
@@ -297,26 +316,60 @@ def qoder_branches(records, *, all_branches):
         return (tip if tip not in seen else None), list(reversed(path))
 
     parent, active = take_path(leaf if isinstance(leaf, str) else None)
-    tool_ids = {block['id'] for record in active if record.get('type') == 'assistant'
-                for block in _message_blocks(record)
-                if isinstance(block, dict) and block.get('type') == 'tool_use'
-                and isinstance(block.get('id'), str) and block['id']}
-    parallel_results = set()
-    if tool_ids:
-        for uuid, record in nodes.items():
-            call = record.get('parentUuid')
-            if (uuid in claimed or record.get('type') != 'user' or record.get('isMeta')
-                    or not isinstance(call, str) or call not in claimed):
-                continue
+    file_order = {id(rec): idx for idx, rec in enumerate(nodes.values())}
+    call_positions = {block['id']: position for position, record in enumerate(active)
+                      if record.get('type') == 'assistant'
+                      for block in _message_blocks(record)
+                      if isinstance(block, dict) and block.get('type') == 'tool_use'
+                      and isinstance(block.get('id'), str) and block['id']}
+    if call_positions:
+        def _result_owner(record):
+            if record.get('type') != 'user' or record.get('isMeta'):
+                return None
             blocks = _message_blocks(record)
             if blocks and all(isinstance(block, dict) and block.get('type') == 'tool_result'
-                              and isinstance(block.get('tool_use_id'), str) and block['tool_use_id'] in tool_ids
-                              for block in blocks):
-                parallel_results.add(uuid)
-    if parallel_results:
-        # The next reply may link to just one result from a batch of parallel calls.
-        claimed.update(parallel_results)
-        active = [record for uuid, record in nodes.items() if uuid in claimed]
+                              and isinstance(block.get('tool_use_id'), str)
+                              and block['tool_use_id'] in call_positions for block in blocks):
+                return max(call_positions[block['tool_use_id']] for block in blocks)
+            return None
+
+        grouped_results = {}
+        kept_active = []
+        active_ids = claimed.copy()
+        for record in active:
+            owner = _result_owner(record)
+            if owner is not None:
+                grouped_results.setdefault(owner, []).append((record, kept_active, len(kept_active)))
+            else:
+                kept_active.append(record)
+        has_parallel = False
+        for uuid, record in nodes.items():
+            call = record.get('parentUuid')
+            if uuid in claimed or not isinstance(call, str) or call not in active_ids:
+                continue
+            owner = _result_owner(record)
+            if owner is not None:
+                grouped_results.setdefault(owner, []).append((record, None, 0))
+                claimed.add(uuid)
+                has_parallel = True
+        if has_parallel:
+            # Keep all tool results for a call batch grouped under that call in recorded order.
+            call_to_kept = {}
+            idx_kept = 0
+            for pos, record in enumerate(active):
+                if _result_owner(record) is None:
+                    call_to_kept[pos] = idx_kept
+                    idx_kept += 1
+            by_kept = {
+                call_to_kept[owner]: sorted(
+                    (item[0] for item in items), key=lambda rec: file_order.get(id(rec), 0)
+                )
+                for owner, items in grouped_results.items() if owner in call_to_kept
+            }
+            active = [
+                entry for idx, record in enumerate(kept_active)
+                for entry in (record, *by_kept.get(idx, ()))
+            ]
     paths = [(parent, active)]
     if all_branches:
         for tip in reversed(nodes):

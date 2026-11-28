@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -28,6 +29,15 @@ class QueryPrefilterTest(unittest.TestCase):
                 row = json.dumps({'text': 'x' * (256 * 1024 - 11) + text}, ensure_ascii=ascii_only)
                 stream = io.BytesIO((row + '\n{"text":"other row"}\n').encode('utf-8'))
                 self.assertEqual(QueryPrefilter(query).may_match(stream), expected)
+
+    def test_lf_crlf_and_cr_records_have_the_same_prefilter_result(self):
+        ignored = re.compile(rb'^\{"type":"ignored"')
+        for separator in (b'\n', b'\r\n', b'\r'):
+            for raw, expected in ((b'{"text":"query"}', True), (b'{"text":"unrelated"}', False)):
+                with self.subTest(separator=separator, expected=expected):
+                    data = separator.join((b'{"type":"ignored","text":"query"}', raw))
+                    self.assertEqual(QueryPrefilter('query').may_match(io.BytesIO(data), ignored=ignored),
+                                     expected)
 
 
 class ScanReportTest(unittest.TestCase):

@@ -41,12 +41,12 @@ You explored an architecture in **Antigravity** and want **Codex** to implement 
 
 | Agent | Default Local Store | What `pickup` Reads |
 | :--- | :--- | :--- |
-| **Antigravity** | `~/.gemini/antigravity/` | Transcripts and recent task logs, with a read-only `conversations_fts` text fallback |
+| **Antigravity** | `~/.gemini/antigravity/`, `~/.gemini/antigravity-cli/` | Transcripts and recent task logs, with a read-only `conversations_fts` text fallback |
 | **Codex** | `~/.codex/sessions/`, `~/.codex/archived_sessions/`, `~/.codex/thread_history_1.sqlite` | JSONL and `.jsonl.zst` rollouts, with a read-only SQLite dialogue fallback for missing rollouts |
 | **Claude Code** | `~/.claude/projects/` | Project and nested subagent JSONL, including text blocks in tool results |
 | **Qoder** | `~/.qoder/projects/`, `~/.qoder-cn/projects/`, `~/.qoderwork/projects/` | Active-branch dialogue and searchable branch history, including nested subagents |
 | **Pi** | `~/.pi/agent/sessions/` | Reconstructs active branch via last persisted parent chain, keeping earlier turns along the path |
-| **Kimi Code** | `~/.kimi-code/sessions/` | Committed main-agent messages, deduplicating replay events |
+| **Kimi Code** | `~/.kimi-code/sessions/` | Committed main-agent and subagent messages, deduplicating replay events |
 | **Devin CLI** | `~/.local/share/devin/cli/sessions.db` | Read-only SQLite query along the active message branch |
 
 > Adapters reflect observed macOS storage formats. Paths and formats may work on other Unix-like systems but are not yet verified across OSes, and client updates may change formats over time. Cloud-only web sessions, binary attachments, and separate subagent histories are outside completeness guarantees.
@@ -55,7 +55,7 @@ You explored an architecture in **Antigravity** and want **Codex** to implement 
 
 ## Installation
 
-Requires **Python 3.10+**. Reading Zstandard-compressed Codex records requires Python 3.14's standard library or the system `zstd` command.
+Requires **Python 3.9+**. Reading Zstandard-compressed Codex records uses the Python 3.14+ standard library, system `libzstd`, or the `zstd` command.
 
 ### 1. Clone and verify the CLI
 
@@ -120,7 +120,7 @@ python3 scripts/pickup.py --exclude '<full-session-id-or-uid>'
 ```
 
 - **Discovery only — never auto-loads #1**: without a query, candidates sort by file modification time; with a query, matches in parsed titles, summaries, and dialogue outrank tool-output matches.
-- A local session ID supplied by the caller excludes the current session. Use `--exclude` when the environment has no ID. For Claude Code, a caller can supply `CLAUDE_SESSION_ID` from the hook input `session_id`. [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
+- Searches and lists exclude all inherited caller session IDs. Use `--exclude` for additional exclusions. Use `show` or `read` to open a known parent session directly. For Claude Code, a caller can supply `CLAUDE_SESSION_ID` from the hook input `session_id`. [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
 - Keyword matches include the source role, turn and text snippet to help assess candidates. `--agent` limits sources before discovery.
 - `--project` matches workspace paths. `--since` includes records modified on or after the given local date. These filters can skip transcript reads when the relevant metadata is available. `--model` matches names recorded in Codex, Antigravity, Claude Code and Qoder transcripts, including sessions that switched models.
 - Titles, workspace names and exact phrases in ordinary dialogue rank above pickup requests and tool output. A later user message ranks lower when it cites the matching assistant session or repeats a substantial part of the assistant reply. Use `open match` to read the passage.
@@ -136,7 +136,7 @@ python3 scripts/pickup.py show 'codex://threads/<full-session-id>'
 
 Returns an outline of user prompts, shortened recent turns, tool call summaries, and available errors or background task logs. When several files share a session ID, use the record UID with an `@` suffix from the candidate list or ambiguity message.
 
-Open local Antigravity, Codex, Claude Code, and Qoder subagents by ID. Keyword searches and recent lists default to main sessions. Add `--include-subagents` to include subagents.
+Open local Antigravity, Codex, Claude Code, Qoder, and Kimi Code subagents by ID. Keyword searches and recent lists default to main sessions. Add `--include-subagents` to include subagents. Kimi Code subagent UIDs include the parent session ID, as in `kimi:<session-id>/agent-0`.
 
 ### 3. Read deeper on demand (`read`)
 
@@ -170,9 +170,9 @@ python3 scripts/pickup.py export '<uid>' --turns 8-10 --turns 15 --output ~/Down
 python3 scripts/pickup.py export '<uid>' --format raw --output ~/Downloads/session.jsonl
 ```
 
-Markdown export saves the full decoded dialogue and tool summaries. Add `--with-tools` for output snippets. Raw export copies the selected file's bytes. Keep the original extension, such as `.jsonl.zst` for compressed sources. For Kimi Code, the source is the main agent's wire log. For Devin CLI, the raw export is JSONL with the selected session's message nodes and active branch pointer. Choose a new output path.
+Markdown export saves the full decoded dialogue and tool summaries. Add `--with-tools` for output snippets. Raw export copies the selected file's bytes. Keep the original extension, such as `.jsonl.zst` for compressed sources. For Kimi Code, the source is the selected agent's wire log. For Devin CLI, the raw export is JSONL with the selected session's message nodes and active branch pointer. Choose a new output path.
 
-If the transcript is missing, Antigravity can use indexed text from `conversations_fts` and Codex can use projected user and assistant messages from `thread_items`. Search, `show`, `read`, and Markdown export label the fallback. These records have no raw export or tool details. The Antigravity CLI binary step stores are outside this support.
+If the transcript is missing, Antigravity can use indexed text from `conversations_fts` and Codex can use projected user and assistant messages from `thread_items`. Search, `show`, `read`, and Markdown export label the fallback. The SQLite adapters currently surface dialogue turns. The databases may also retain tool records, such as Codex command execution entries. Raw export requires a transcript. The Antigravity CLI binary step stores are outside this support.
 
 ### Using pickup in chat
 

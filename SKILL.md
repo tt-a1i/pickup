@@ -30,11 +30,11 @@ pickup
 
 Search results and recent lists are candidates. Use the role, excerpt, and turn to choose. Keep the exact wording of a distinctive phrase from a quote or screenshot. Use `--agent` for a known source and `--project`, `--since`, or `--model` for supplied clues. If several records remain plausible, present the candidates. Without a clue, list recent sessions and ask the user to choose. Use the record UID from the ambiguity message when multiple files share an ID.
 
-Open local Antigravity, Codex, Claude Code, and Qoder subagents directly by ID. Add `--include-subagents` to search or list them. Qoder reads follow the active branch. Text search and `read --grep` also find off-branch passages. Open those turns with `--all-branches --turns X`.
+Open local Antigravity, Codex, Claude Code, Qoder, and Kimi Code subagents directly by ID. Add `--include-subagents` to search or list them. Qoder reads follow the active branch. Search and `read --grep` also find off-branch passages. Open those turns with `--all-branches --turns X`.
 
-Pickup excludes a current session when its local ID is supplied by the caller. Use `--exclude <full-id-or-uid>` when the environment has no ID. For Claude Code, a caller can supply `CLAUDE_SESSION_ID` from the documented hook input `session_id`. [Claude Code hooks](https://code.claude.com/docs/en/hooks#common-input-fields)
+Nested hosts inherit caller session IDs. Search and list exclude every supplied ID, including `ANTIGRAVITY_CONVERSATION_ID`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, and `CLAUDE_SESSION_ID`. Use `--exclude <id>` for additional exclusions. `show <id>` and `read <id>` still open a known parent session directly.
 
-Check stderr coverage and fidelity labels. Antigravity can fall back to SQLite indexed text and Codex to SQLite projected dialogue when raw transcripts are missing. These sources support search, read, and Markdown export. For raw events and tool details, a raw transcript is required. Metadata-only results can still identify a session by title or ID.
+Check stderr coverage and fidelity labels. When transcripts are missing, SQLite fallback adapters surface Antigravity indexed text or Codex projected dialogue. Search, read, and Markdown export support these dialogue turns. Inspect SQLite separately for retained tool records such as Codex command executions. Raw export requires a transcript. Metadata-only results can still identify sessions by title or ID.
 
 ## Continue the current task
 
